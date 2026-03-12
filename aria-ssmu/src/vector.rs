@@ -97,16 +97,7 @@ impl KeywordIndex {
         let query_parser = QueryParser::for_index(&self.index, vec![self.content_field]);
 
         // Escape special characters in user query to prevent parse errors
-        let sanitized = query_text
-            .replace(':', " ")
-            .replace('(', " ")
-            .replace(')', " ")
-            .replace('[', " ")
-            .replace(']', " ")
-            .replace('{', " ")
-            .replace('}', " ")
-            .replace('"', " ")
-            .replace('\\', " ");
+        let sanitized = query_text.replace([':', '(', ')', '[', ']', '{', '}', '"', '\\'], " ");
 
         let query = query_parser
             .parse_query(&sanitized)
@@ -122,10 +113,10 @@ impl KeywordIndex {
                 .doc(doc_address)
                 .map_err(|e| format!("tantivy doc: {}", e))?;
 
-            if let Some(val) = retrieved.get_first(self.doc_id_field) {
-                if let tantivy::schema::OwnedValue::Str(id) = val {
-                    results.push((id.to_string(), score));
-                }
+            if let Some(tantivy::schema::OwnedValue::Str(id)) =
+                retrieved.get_first(self.doc_id_field)
+            {
+                results.push((id.to_string(), score));
             }
         }
 
@@ -429,6 +420,7 @@ impl VectorStore {
     ///
     /// When searching with `search_with_parent`, the micro-chunk match will return
     /// the parent chunk so that the LLM sees the broader context.
+    #[allow(clippy::too_many_arguments)]
     pub fn index_document_with_parent(
         &mut self,
         micro_id: impl Into<String>,

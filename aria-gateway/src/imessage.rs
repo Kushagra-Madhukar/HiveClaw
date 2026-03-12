@@ -1,7 +1,10 @@
-use aria_core::{AgentRequest, GatewayChannel};
+use aria_core::{AgentRequest, GatewayChannel, InboundEnvelope};
 use serde::Deserialize;
 
-use crate::{normalizer::build_text_request, GatewayError};
+use crate::{
+    normalizer::{build_text_envelope, inbound_envelope_to_request},
+    GatewayError,
+};
 
 #[derive(Debug, Deserialize)]
 struct IMessagePayload {
@@ -14,10 +17,10 @@ struct IMessagePayload {
 pub struct IMessageNormalizer;
 
 impl IMessageNormalizer {
-    pub fn normalize(json: &str) -> Result<AgentRequest, GatewayError> {
+    pub fn normalize_envelope(json: &str) -> Result<InboundEnvelope, GatewayError> {
         let payload: IMessagePayload =
             serde_json::from_str(json).map_err(|e| GatewayError::ParseError(e.to_string()))?;
-        Ok(build_text_request(
+        Ok(build_text_envelope(
             GatewayChannel::IMessage,
             payload.sender_id,
             payload.thread_id,
@@ -25,5 +28,9 @@ impl IMessageNormalizer {
             payload.body,
             payload.timestamp_us,
         ))
+    }
+
+    pub fn normalize(json: &str) -> Result<AgentRequest, GatewayError> {
+        Self::normalize_envelope(json).map(inbound_envelope_to_request)
     }
 }

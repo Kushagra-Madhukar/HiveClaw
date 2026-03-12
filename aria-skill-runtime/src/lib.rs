@@ -6,7 +6,11 @@
 //! for running Wasm-based skills inside a strict sandbox with configurable
 //! memory limits and no host filesystem access.
 
-use aria_core::{ConstraintViolation, HardwareIntent};
+use aria_core::{
+    ConstraintViolation, HardwareIntent, SkillActivationPolicy, SkillBinding, SkillPackageManifest,
+};
+use std::collections::BTreeMap;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -21,6 +25,175 @@ pub enum RuntimeError {
     ExecutionError(String),
     /// A capability violation occurred (e.g. unauthorized host call).
     CapabilityViolation(String),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct SkillTomlFile {
+    skill_id: String,
+    name: String,
+    description: String,
+    version: String,
+    #[serde(default = "default_skill_entry_document")]
+    entry_document: String,
+    #[serde(default)]
+    tool_names: Vec<String>,
+    #[serde(default)]
+    mcp_server_dependencies: Vec<String>,
+    #[serde(default)]
+    retrieval_hints: Vec<String>,
+    #[serde(default)]
+    wasm_module_ref: Option<String>,
+    #[serde(default)]
+    config_schema: Option<String>,
+    #[serde(default = "default_skill_enabled")]
+    enabled: bool,
+}
+
+fn default_skill_entry_document() -> String {
+    "SKILL.md".into()
+}
+
+fn default_skill_enabled() -> bool {
+    true
+}
+
+pub fn validate_skill_manifest(manifest: &SkillPackageManifest) -> Result<(), RuntimeError> {
+    if manifest.skill_id.trim().is_empty() {
+        return Err(RuntimeError::LoadError(
+            "skill manifest validation failed: missing skill_id".into(),
+        ));
+    }
+    if manifest.name.trim().is_empty() {
+        return Err(RuntimeError::LoadError(
+            "skill manifest validation failed: missing name".into(),
+        ));
+    }
+    if manifest.version.trim().is_empty() {
+        return Err(RuntimeError::LoadError(
+            "skill manifest validation failed: missing version".into(),
+        ));
+    }
+    if manifest.entry_document.trim().is_empty() {
+        return Err(RuntimeError::LoadError(
+            "skill manifest validation failed: missing entry_document".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn parse_skill_manifest_toml(input: &str) -> Result<SkillPackageManifest, RuntimeError> {
+    let parsed: SkillTomlFile = toml::from_str(input)
+        .map_err(|e| RuntimeError::LoadError(format!("skill manifest parse failed: {}", e)))?;
+    let manifest = SkillPackageManifest {
+        skill_id: parsed.skill_id,
+        name: parsed.name,
+        description: parsed.description,
+        version: parsed.version,
+        entry_document: parsed.entry_document,
+        tool_names: parsed.tool_names,
+        mcp_server_dependencies: parsed.mcp_server_dependencies,
+        retrieval_hints: parsed.retrieval_hints,
+        wasm_module_ref: parsed.wasm_module_ref,
+        config_schema: parsed.config_schema,
+        enabled: parsed.enabled,
+    };
+    validate_skill_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+pub fn load_skill_manifest_from_dir(
+    skill_dir: &Path,
+) -> Result<SkillPackageManifest, RuntimeError> {
+    let manifest_path = skill_dir.join("skill.toml");
+    let content = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        RuntimeError::LoadError(format!(
+            "failed to read skill manifest '{}': {}",
+            manifest_path.display(),
+            e
+        ))
+    })?;
+    let manifest = parse_skill_manifest_toml(&content)?;
+    let entry_document = skill_dir.join(&manifest.entry_document);
+    if !entry_document.exists() {
+        return Err(RuntimeError::LoadError(format!(
+            "skill manifest validation failed: entry document '{}' missing",
+            entry_document.display()
+        )));
+    }
+    Ok(manifest)
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SkillRegistry {
+    manifests: BTreeMap<String, SkillPackageManifest>,
+    bindings: Vec<SkillBinding>,
+}
+
+impl SkillRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn install_manifest(&mut self, manifest: SkillPackageManifest) -> Result<(), RuntimeError> {
+        validate_skill_manifest(&manifest)?;
+        self.manifests.insert(manifest.skill_id.clone(), manifest);
+        Ok(())
+    }
+
+    pub fn list_manifests(&self) -> Vec<SkillPackageManifest> {
+        self.manifests.values().cloned().collect()
+    }
+
+    pub fn set_enabled(&mut self, skill_id: &str, enabled: bool) -> Result<(), RuntimeError> {
+        let manifest = self
+            .manifests
+            .get_mut(skill_id)
+            .ok_or_else(|| RuntimeError::LoadError(format!("unknown skill '{}'", skill_id)))?;
+        manifest.enabled = enabled;
+        Ok(())
+    }
+
+    pub fn bind_skill(&mut self, binding: SkillBinding) -> Result<(), RuntimeError> {
+        if !self.manifests.contains_key(&binding.skill_id) {
+            return Err(RuntimeError::LoadError(format!(
+                "cannot bind unknown skill '{}'",
+                binding.skill_id
+            )));
+        }
+        self.bindings.retain(|existing| {
+            !(existing.skill_id == binding.skill_id && existing.agent_id == binding.agent_id)
+        });
+        self.bindings.push(binding);
+        Ok(())
+    }
+
+    pub fn list_bindings_for_agent(&self, agent_id: &str) -> Vec<SkillBinding> {
+        self.bindings
+            .iter()
+            .filter(|binding| binding.agent_id == agent_id)
+            .cloned()
+            .collect()
+    }
+
+    pub fn skill_allowed_for_agent(&self, agent_id: &str, skill_id: &str) -> bool {
+        let Some(manifest) = self.manifests.get(skill_id) else {
+            return false;
+        };
+        if !manifest.enabled {
+            return false;
+        }
+        self.bindings.iter().any(|binding| {
+            binding.agent_id == agent_id
+                && binding.skill_id == skill_id
+                && matches!(
+                    binding.activation_policy,
+                    SkillActivationPolicy::Manual
+                        | SkillActivationPolicy::AutoSuggest
+                        | SkillActivationPolicy::AutoLoadLowRisk
+                        | SkillActivationPolicy::ApprovalRequired
+                )
+        })
+    }
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -998,6 +1171,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "signing")]
     #[test]
     fn signature_verification_accepts_valid_signed_module() {
         use ed25519_dalek::SigningKey;
@@ -1276,5 +1450,85 @@ mod tests {
         let hash = cache.precompile(bytes.clone()).unwrap();
         assert!(cache.contains(&hash));
         assert_eq!(cache.get(&hash).unwrap(), bytes);
+    }
+
+    #[test]
+    fn parse_skill_manifest_toml_applies_defaults_and_validates() {
+        let manifest = parse_skill_manifest_toml(
+            r#"
+skill_id = "github_review"
+name = "GitHub Review"
+description = "Review pull requests"
+version = "1.0.0"
+tool_names = ["read_file"]
+mcp_server_dependencies = ["github"]
+"#,
+        )
+        .expect("parse skill manifest");
+
+        assert_eq!(manifest.skill_id, "github_review");
+        assert_eq!(manifest.entry_document, "SKILL.md");
+        assert!(manifest.enabled);
+        assert_eq!(manifest.tool_names, vec!["read_file"]);
+        assert_eq!(manifest.mcp_server_dependencies, vec!["github"]);
+    }
+
+    #[test]
+    fn load_skill_manifest_from_dir_requires_entry_document() {
+        let temp = tempfile::tempdir().expect("skill tempdir");
+        std::fs::write(
+            temp.path().join("skill.toml"),
+            r#"
+skill_id = "repo_memory"
+name = "Repo Memory"
+description = "Remember repo facts"
+version = "0.1.0"
+"#,
+        )
+        .expect("write manifest");
+
+        let err = load_skill_manifest_from_dir(temp.path()).expect_err("missing SKILL.md");
+        assert!(format!("{}", err).contains("entry document"));
+
+        std::fs::write(temp.path().join("SKILL.md"), "# Repo Memory").expect("write skill doc");
+        let manifest = load_skill_manifest_from_dir(temp.path()).expect("load skill manifest");
+        assert_eq!(manifest.skill_id, "repo_memory");
+    }
+
+    #[test]
+    fn skill_registry_installs_binds_and_respects_enablement() {
+        let mut registry = SkillRegistry::new();
+        registry
+            .install_manifest(SkillPackageManifest {
+                skill_id: "github_review".into(),
+                name: "GitHub Review".into(),
+                description: "Review PRs".into(),
+                version: "1.0.0".into(),
+                entry_document: "SKILL.md".into(),
+                tool_names: vec!["read_file".into()],
+                mcp_server_dependencies: vec!["github".into()],
+                retrieval_hints: vec!["repo".into()],
+                wasm_module_ref: None,
+                config_schema: None,
+                enabled: true,
+            })
+            .expect("install skill");
+        registry
+            .bind_skill(SkillBinding {
+                binding_id: "bind-1".into(),
+                agent_id: "developer".into(),
+                skill_id: "github_review".into(),
+                activation_policy: SkillActivationPolicy::AutoSuggest,
+                created_at_us: 1,
+            })
+            .expect("bind skill");
+
+        assert!(registry.skill_allowed_for_agent("developer", "github_review"));
+        assert_eq!(registry.list_bindings_for_agent("developer").len(), 1);
+
+        registry
+            .set_enabled("github_review", false)
+            .expect("disable skill");
+        assert!(!registry.skill_allowed_for_agent("developer", "github_review"));
     }
 }

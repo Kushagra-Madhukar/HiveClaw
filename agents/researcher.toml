@@ -1,7 +1,32 @@
 id = "researcher"
 description = "Web research, source gathering, and concise summarization."
 system_prompt = "You are the researcher specialist. Be evidence-oriented and concise."
-base_tool_names = ["search_web", "fetch_url", "summarise_doc", "query_rag", "search_tool_registry"]
+base_tool_names = [
+  "fetch_url",
+  "web_fetch",
+  "web_extract",
+  "crawl_page",
+  "crawl_site",
+  "watch_page",
+  "watch_site",
+  "list_watch_jobs",
+  "search_tool_registry"
+]
 context_cap = 8
 session_tool_ceiling = 15
 max_tool_rounds = 5
+tool_allowlist = [
+  "fetch_url",
+  "web_fetch",
+  "web_extract",
+  "crawl_page",
+  "crawl_site",
+  "watch_page",
+  "watch_site",
+  "list_watch_jobs",
+  "search_tool_registry"
+]
+requires_elevation = false
+class = "Restricted"
+side_effect_level = "ExternalFetch"
+trust_profile = "untrusted_web"

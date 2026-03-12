@@ -14,8 +14,36 @@ base_tool_names = [
   "manage_cron",
   "schedule_message",
   "set_reminder",
-  "search_tool_registry"
+  "search_tool_registry",
+  "browser_profile_create",
+  "browser_profile_list",
+  "browser_profile_use",
+  "browser_session_start",
+  "browser_session_list",
+  "browser_session_status",
+  "browser_open",
+  "browser_snapshot",
+  "browser_extract",
+  "browser_screenshot",
+  "browser_act",
+  "browser_login_status",
+  "browser_login_begin_manual",
+  "browser_login_complete_manual",
+  "browser_login_fill_credentials",
+  "spawn_agent",
+  "list_agent_runs",
+  "get_agent_run",
+  "get_agent_run_events",
+  "get_agent_mailbox",
+  "cancel_agent_run",
+  "retry_agent_run"
 ]
 context_cap = 8
 session_tool_ceiling = 15
 max_tool_rounds = 5
+
+[delegation_scope]
+can_spawn_children = true
+allowed_agents = ["researcher", "developer", "productivity"]
+max_fanout = 3
+max_runtime_seconds = 120

@@ -1,0 +1,13 @@
+[package]
+name = "aria-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "MCP registry and allowlist enforcement for ARIA-X"
+
+[dependencies]
+aria-core = { path = "../aria-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

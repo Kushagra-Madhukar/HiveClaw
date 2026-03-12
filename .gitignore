@@ -6,6 +6,7 @@ aria-skill-runtime/test-plugins/**/target/
 
 # Logs
 *.log
+logs/dev/
 
 # Rust backups
 **/*.rs.bk
@@ -24,3 +25,36 @@ run_patch.sh
 /benches/*.exe
 
 /.fastembed_cache/*
+
+# Local secrets / env
+.env
+.env.local
+.env.*
+!.env.example
+vault.json
+
+# Local runtime state
+workspace/sessions/
+aria-x/tmp-live/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.jsonl
+
+# Local live configs and TUI temp configs
+aria-x/config.runtime.json
+config.live*.toml
+config.live*.runtime.json
+config.live*.runtime.log
+*.tui-*.toml
+*.tui-*.runtime.json
+*.tui-*.runtime.log
+
+# Local scratch artifacts
+hello.js
+hello2.js
+new_good.js
+new_ok.js
+new_new_ok.js
+ok.js
+test_json

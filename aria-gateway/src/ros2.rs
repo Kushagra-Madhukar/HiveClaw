@@ -4,7 +4,8 @@
 //! Gateway can normalize them into `AgentRequest` values without depending
 //! on a specific ROS2 client library at this stage.
 
-use aria_core::{AgentRequest, GatewayChannel, MessageContent};
+use crate::normalizer::inbound_envelope_to_request;
+use aria_core::{AgentRequest, GatewayChannel, InboundEnvelope, MessageContent};
 
 /// Simplified representation of a ROS2 string message on a topic.
 #[derive(Debug, Clone)]
@@ -34,12 +35,19 @@ fn channel_from_topic(topic: &str) -> GatewayChannel {
 
 /// Normalize a ROS2 string message into an `AgentRequest`.
 pub fn normalize_ros2_message(msg: Ros2StringMessage, user_id: &str) -> AgentRequest {
-    AgentRequest {
-        request_id: *uuid::Uuid::new_v4().as_bytes(),
+    inbound_envelope_to_request(normalize_ros2_envelope(msg, user_id))
+}
+
+/// Normalize a ROS2 string message into an `InboundEnvelope`.
+pub fn normalize_ros2_envelope(msg: Ros2StringMessage, user_id: &str) -> InboundEnvelope {
+    InboundEnvelope {
+        envelope_id: *uuid::Uuid::new_v4().as_bytes(),
         session_id: *uuid::Uuid::new_v4().as_bytes(),
         channel: channel_from_topic(&msg.topic),
         user_id: user_id.to_string(),
+        provider_message_id: Some(msg.topic.clone()),
         content: MessageContent::Text(msg.data),
+        attachments: Vec::new(),
         timestamp_us: 0,
     }
 }
@@ -71,5 +79,18 @@ mod tests {
         };
         let req = normalize_ros2_message(msg, "user");
         assert!(matches!(req.channel, GatewayChannel::Unknown));
+    }
+
+    #[test]
+    fn normalize_ros2_envelope_sets_provider_message_id() {
+        let msg = Ros2StringMessage {
+            topic: "/ros2/companion/alerts".into(),
+            data: "fire".into(),
+        };
+        let envelope = normalize_ros2_envelope(msg, "u1");
+        assert_eq!(
+            envelope.provider_message_id.as_deref(),
+            Some("/ros2/companion/alerts")
+        );
     }
 }

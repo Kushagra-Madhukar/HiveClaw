@@ -16,7 +16,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -490,6 +493,7 @@ pub struct SessionState {
     pub durable_constraints: Vec<String>,
     pub current_agent: Option<String>,
     pub current_model: Option<String>,
+    pub version: u64,
 }
 
 /// Thread-safe, per-session message history and state overrides.
@@ -501,6 +505,7 @@ pub struct SessionState {
 pub struct SessionMemory {
     window_size: usize,
     store: Arc<RwLock<HashMap<uuid::Uuid, SessionState>>>,
+    sqlite_path: Option<PathBuf>,
 }
 
 impl SessionMemory {
@@ -509,6 +514,16 @@ impl SessionMemory {
         Self {
             window_size,
             store: Arc::new(RwLock::new(HashMap::new())),
+            sqlite_path: None,
+        }
+    }
+
+    /// Create a SQLite-backed session memory that persists mutations eagerly.
+    pub fn new_sqlite_backed<P: Into<PathBuf>>(window_size: usize, sqlite_path: P) -> Self {
+        Self {
+            window_size,
+            store: Arc::new(RwLock::new(HashMap::new())),
+            sqlite_path: Some(sqlite_path.into()),
         }
     }
 
@@ -517,14 +532,6 @@ impl SessionMemory {
     /// If the session's history exceeds `window_size`, the oldest
     /// message is removed.
     pub fn append(&self, session_id: uuid::Uuid, message: Message) -> Result<(), String> {
-        let mut store = self
-            .store
-            .write()
-            .map_err(|e| format!("lock poisoned: {}", e))?;
-
-        let state = store
-            .entry(session_id)
-            .or_insert_with(SessionState::default);
         let content_preview: String = message.content.chars().take(100).collect();
         debug!(
             session_id = %session_id,
@@ -533,13 +540,19 @@ impl SessionMemory {
             content_preview = %content_preview,
             "SessionMemory: append"
         );
-        state.history.push_back(message);
-
-        if state.history.len() > self.window_size {
-            state.history.pop_front();
-        }
-
-        Ok(())
+        let event_message = message.clone();
+        self.apply_session_mutation(
+            session_id,
+            persistence::SessionEvent::AppendMessage {
+                message: event_message,
+            },
+            move |state, window_size| {
+                state.history.push_back(message.clone());
+                while state.history.len() > window_size {
+                    state.history.pop_front();
+                }
+            },
+        )
     }
 
     /// Append a durable constraint to the session memory.
@@ -548,15 +561,16 @@ impl SessionMemory {
         session_id: uuid::Uuid,
         constraint: String,
     ) -> Result<(), String> {
-        let mut store = self
-            .store
-            .write()
-            .map_err(|e| format!("lock poisoned: {}", e))?;
-        let state = store
-            .entry(session_id)
-            .or_insert_with(SessionState::default);
-        state.durable_constraints.push(constraint);
-        Ok(())
+        let event_constraint = constraint.clone();
+        self.apply_session_mutation(
+            session_id,
+            persistence::SessionEvent::AddConstraint {
+                constraint: event_constraint,
+            },
+            move |state, _| {
+                state.durable_constraints.push(constraint.clone());
+            },
+        )
     }
 
     /// Get all durable constraints for a session.
@@ -593,15 +607,13 @@ impl SessionMemory {
 
     /// Clears the message history for a given session.
     pub fn clear_history(&self, session_id: &uuid::Uuid) -> Result<(), String> {
-        let mut store = self
-            .store
-            .write()
-            .map_err(|e| format!("lock poisoned: {}", e))?;
-
-        if let Some(state) = store.get_mut(session_id) {
-            state.history.clear();
-        }
-        Ok(())
+        self.apply_session_mutation(
+            *session_id,
+            persistence::SessionEvent::ClearHistory,
+            |state, _| {
+                state.history.clear();
+            },
+        )
     }
 
     /// Set the current agent/model overrides for a session.
@@ -611,20 +623,21 @@ impl SessionMemory {
         agent: Option<String>,
         model: Option<String>,
     ) -> Result<(), String> {
-        let mut store = self
-            .store
-            .write()
-            .map_err(|e| format!("lock poisoned: {}", e))?;
-        let state = store
-            .entry(session_id)
-            .or_insert_with(SessionState::default);
-        if let Some(a) = agent {
-            state.current_agent = Some(a);
-        }
-        if let Some(m) = model {
-            state.current_model = Some(m);
-        }
-        Ok(())
+        self.apply_session_mutation(
+            session_id,
+            persistence::SessionEvent::UpdateOverrides {
+                agent: agent.clone(),
+                model: model.clone(),
+            },
+            move |state, _| {
+                if let Some(a) = agent.clone() {
+                    state.current_agent = Some(a);
+                }
+                if let Some(m) = model.clone() {
+                    state.current_model = Some(m);
+                }
+            },
+        )
     }
 
     /// Get the current overrides (agent, model) for a session.
@@ -651,24 +664,23 @@ impl SessionMemory {
         remove_count: usize,
         summary: Message,
     ) -> Result<(), String> {
-        let mut store = self
-            .store
-            .write()
-            .map_err(|e| format!("lock poisoned: {}", e))?;
-        let state = store
-            .entry(session_id)
-            .or_insert_with(SessionState::default);
-
-        let rc = remove_count.min(state.history.len());
-        for _ in 0..rc {
-            state.history.pop_front();
-        }
-        state.history.push_front(summary);
-
-        while state.history.len() > self.window_size {
-            state.history.pop_front();
-        }
-        Ok(())
+        self.apply_session_mutation(
+            session_id,
+            persistence::SessionEvent::ReplaceHistory {
+                remove_count,
+                summary: summary.clone(),
+            },
+            move |state, window_size| {
+                let rc = remove_count.min(state.history.len());
+                for _ in 0..rc {
+                    state.history.pop_front();
+                }
+                state.history.push_front(summary.clone());
+                while state.history.len() > window_size {
+                    state.history.pop_front();
+                }
+            },
+        )
     }
 
     /// Condense the session history when it exceeds `threshold` messages.
@@ -686,24 +698,32 @@ impl SessionMemory {
     where
         F: FnOnce(&[Message]) -> String,
     {
-        let mut store = self
-            .store
-            .write()
-            .map_err(|e| format!("lock poisoned: {}", e))?;
+        let persisted = {
+            let mut store = self
+                .store
+                .write()
+                .map_err(|e| format!("lock poisoned: {}", e))?;
 
-        let history = match store.get_mut(&session_id) {
-            Some(state) if state.history.len() > threshold => &mut state.history,
-            _ => return Ok(false),
+            let history = match store.get_mut(&session_id) {
+                Some(state) if state.history.len() > threshold => &mut state.history,
+                _ => return Ok(false),
+            };
+
+            let all_messages: Vec<Message> = history.iter().cloned().collect();
+            let summary = summarizer(&all_messages);
+            history.clear();
+            history.push_back(Message {
+                role: "summary".into(),
+                content: summary,
+                timestamp_us,
+            });
+
+            store
+                .get(&session_id)
+                .cloned()
+                .ok_or_else(|| "session disappeared during summarization".to_string())?
         };
-
-        let all_messages: Vec<Message> = history.iter().cloned().collect();
-        let summary = summarizer(&all_messages);
-        history.clear();
-        history.push_back(Message {
-            role: "summary".into(),
-            content: summary,
-            timestamp_us,
-        });
+        self.persist_session_if_configured(session_id, &persisted)?;
         Ok(true)
     }
 
@@ -817,6 +837,49 @@ impl SessionMemory {
         Ok(count)
     }
 
+    /// Load all sessions from a unified SQLite database and merge into memory.
+    pub fn load_from_sqlite<P: AsRef<Path>>(&self, path: P) -> Result<LoadReport, String> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(LoadReport {
+                loaded_sessions: 0,
+                skipped_files: 0,
+            });
+        }
+
+        let db = persistence::SqlitePersistence::open(path)
+            .map_err(|e| format!("sqlite open failed: {}", e))?;
+        let session_ids = db
+            .list_sessions()
+            .map_err(|e| format!("sqlite list sessions failed: {}", e))?;
+
+        let mut loaded = 0usize;
+        let mut skipped = 0usize;
+        let mut store = self
+            .store
+            .write()
+            .map_err(|e| format!("lock poisoned: {}", e))?;
+
+        for session_id in session_ids {
+            match db.load_session(session_id) {
+                Ok(Some(mut state)) => {
+                    while state.history.len() > self.window_size {
+                        state.history.pop_front();
+                    }
+                    store.insert(session_id, state);
+                    loaded += 1;
+                }
+                Ok(None) => {}
+                Err(_) => skipped += 1,
+            }
+        }
+
+        Ok(LoadReport {
+            loaded_sessions: loaded,
+            skipped_files: skipped,
+        })
+    }
+
     /// Append a single message event to the session's JSONL audit log.
     pub fn append_audit_event<P: AsRef<Path>>(
         &self,
@@ -921,6 +984,7 @@ impl SessionMemory {
                     durable_constraints: parsed.durable_constraints,
                     current_agent: parsed.current_agent,
                     current_model: parsed.current_model,
+                    version: 0,
                 },
             );
             loaded += 1;
@@ -930,6 +994,99 @@ impl SessionMemory {
             loaded_sessions: loaded,
             skipped_files: skipped,
         })
+    }
+
+    fn persist_session_if_configured(
+        &self,
+        session_id: uuid::Uuid,
+        state: &SessionState,
+    ) -> Result<(), String> {
+        let Some(path) = &self.sqlite_path else {
+            return Ok(());
+        };
+        let mut db = persistence::SqlitePersistence::open(path)
+            .map_err(|e| format!("sqlite open failed: {}", e))?;
+        db.save_session(session_id, state)
+            .map_err(|e| format!("sqlite save failed for {}: {}", session_id, e))
+    }
+
+    fn load_one_from_sqlite(
+        &self,
+        path: &Path,
+        session_id: uuid::Uuid,
+    ) -> Result<Option<SessionState>, String> {
+        let db = persistence::SqlitePersistence::open(path)
+            .map_err(|e| format!("sqlite open failed: {}", e))?;
+        db.load_session(session_id)
+            .map_err(|e| format!("sqlite load failed for {}: {}", session_id, e))
+    }
+
+    fn apply_session_mutation<F>(
+        &self,
+        session_id: uuid::Uuid,
+        event: persistence::SessionEvent,
+        mut mutator: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut SessionState, usize),
+    {
+        let Some(path) = &self.sqlite_path else {
+            let mut store = self
+                .store
+                .write()
+                .map_err(|e| format!("lock poisoned: {}", e))?;
+            let state = store
+                .entry(session_id)
+                .or_insert_with(SessionState::default);
+            mutator(state, self.window_size);
+            return Ok(());
+        };
+
+        for _ in 0..2 {
+            let (mut next_state, expected_version) = {
+                let store = self
+                    .store
+                    .read()
+                    .map_err(|e| format!("lock poisoned: {}", e))?;
+                let base_state = store.get(&session_id).cloned().unwrap_or_default();
+                let expected_version = base_state.version;
+                let mut next_state = base_state;
+                mutator(&mut next_state, self.window_size);
+                (next_state, expected_version)
+            };
+
+            let mut db = persistence::SqlitePersistence::open(path)
+                .map_err(|e| format!("sqlite open failed: {}", e))?;
+            match db.append_event(session_id, expected_version, &event) {
+                Ok(version) => {
+                    next_state.version = version;
+                    let mut store = self
+                        .store
+                        .write()
+                        .map_err(|e| format!("lock poisoned: {}", e))?;
+                    store.insert(session_id, next_state);
+                    return Ok(());
+                }
+                Err(persistence::PersistenceError::VersionConflict { .. }) => {
+                    if let Some(latest) = self.load_one_from_sqlite(path, session_id)? {
+                        let mut store = self
+                            .store
+                            .write()
+                            .map_err(|e| format!("lock poisoned: {}", e))?;
+                        store.insert(session_id, latest);
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    return Err(format!("sqlite append failed for {}: {}", session_id, err));
+                }
+            }
+        }
+
+        Err(format!(
+            "sqlite append failed for {}: version conflict after retry",
+            session_id
+        ))
     }
 }
 
@@ -1497,5 +1654,157 @@ mod tests {
         assert_eq!(history[0].content, "hello persistence");
 
         std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn session_sqlite_backed_memory_persists_mutations_eagerly() {
+        let sqlite_path =
+            std::env::temp_dir().join(format!("aria_ssmu_test_{}.sqlite", uuid::Uuid::new_v4()));
+        let mem = SessionMemory::new_sqlite_backed(10, &sqlite_path);
+        let sid = uuid::Uuid::new_v4();
+
+        mem.append(
+            sid,
+            Message {
+                role: "user".into(),
+                content: "hello sqlite".into(),
+                timestamp_us: 1,
+            },
+        )
+        .unwrap();
+        mem.add_durable_constraint(sid, "always reply briefly".into())
+            .unwrap();
+        mem.update_overrides(sid, Some("researcher".into()), Some("test-model".into()))
+            .unwrap();
+
+        let restored = SessionMemory::new(10);
+        let report = restored.load_from_sqlite(&sqlite_path).unwrap();
+        assert_eq!(report.loaded_sessions, 1);
+        assert_eq!(report.skipped_files, 0);
+
+        let history = restored.get_history(&sid).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "hello sqlite");
+        assert_eq!(
+            restored.get_durable_constraints(&sid).unwrap(),
+            vec!["always reply briefly".to_string()]
+        );
+        assert_eq!(
+            restored.get_overrides(&sid).unwrap(),
+            (
+                Some("researcher".to_string()),
+                Some("test-model".to_string())
+            )
+        );
+
+        std::fs::remove_file(sqlite_path).ok();
+    }
+
+    #[test]
+    fn session_sqlite_event_log_replays_state_after_restart() {
+        let sqlite_path =
+            std::env::temp_dir().join(format!("aria_ssmu_test_{}.sqlite", uuid::Uuid::new_v4()));
+        let mem = SessionMemory::new_sqlite_backed(10, &sqlite_path);
+        let sid = uuid::Uuid::new_v4();
+
+        mem.append(
+            sid,
+            Message {
+                role: "user".into(),
+                content: "first".into(),
+                timestamp_us: 1,
+            },
+        )
+        .unwrap();
+        mem.append(
+            sid,
+            Message {
+                role: "assistant".into(),
+                content: "second".into(),
+                timestamp_us: 2,
+            },
+        )
+        .unwrap();
+        mem.add_durable_constraint(sid, "stay terse".into())
+            .unwrap();
+        mem.clear_history(&sid).unwrap();
+        mem.append(
+            sid,
+            Message {
+                role: "assistant".into(),
+                content: "after-clear".into(),
+                timestamp_us: 3,
+            },
+        )
+        .unwrap();
+        mem.update_overrides(sid, Some("researcher".into()), None)
+            .unwrap();
+
+        let restored = SessionMemory::new(10);
+        let report = restored.load_from_sqlite(&sqlite_path).unwrap();
+        assert_eq!(report.loaded_sessions, 1);
+        assert_eq!(
+            restored
+                .get_history(&sid)
+                .unwrap()
+                .into_iter()
+                .map(|msg| msg.content)
+                .collect::<Vec<_>>(),
+            vec!["after-clear".to_string()]
+        );
+        assert_eq!(
+            restored.get_durable_constraints(&sid).unwrap(),
+            vec!["stay terse".to_string()]
+        );
+        assert_eq!(
+            restored.get_overrides(&sid).unwrap(),
+            (Some("researcher".to_string()), None)
+        );
+
+        std::fs::remove_file(sqlite_path).ok();
+    }
+
+    #[test]
+    fn session_sqlite_backed_memory_retries_stale_writer_without_losing_history() {
+        let sqlite_path =
+            std::env::temp_dir().join(format!("aria_ssmu_test_{}.sqlite", uuid::Uuid::new_v4()));
+        let writer_a = SessionMemory::new_sqlite_backed(10, &sqlite_path);
+        let writer_b = SessionMemory::new_sqlite_backed(10, &sqlite_path);
+        let sid = uuid::Uuid::new_v4();
+
+        writer_a
+            .append(
+                sid,
+                Message {
+                    role: "user".into(),
+                    content: "from-a".into(),
+                    timestamp_us: 1,
+                },
+            )
+            .unwrap();
+        writer_b
+            .append(
+                sid,
+                Message {
+                    role: "assistant".into(),
+                    content: "from-b".into(),
+                    timestamp_us: 2,
+                },
+            )
+            .unwrap();
+
+        let restored = SessionMemory::new(10);
+        restored.load_from_sqlite(&sqlite_path).unwrap();
+        assert_eq!(
+            restored
+                .get_history(&sid)
+                .unwrap()
+                .into_iter()
+                .map(|msg| msg.content)
+                .collect::<Vec<_>>(),
+            vec!["from-a".to_string(), "from-b".to_string()]
+        );
+
+        std::fs::remove_file(sqlite_path).ok();
     }
 }

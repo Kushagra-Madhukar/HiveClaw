@@ -5,10 +5,9 @@
 
 use aria_core::{AgentRequest, GatewayChannel, MessageContent};
 use aria_intelligence::{
-    backends::{self, ollama::OllamaBackend},
     llm_route_fallback, AgentOrchestrator, CachedTool, DynamicToolCache, LLMBackend, LLMResponse,
     LlmBackendPool, LocalHashEmbedder, OrchestratorError, RouteConfig, RouterDecision,
-    SemanticRouter, ToolCall, ToolExecutor, ToolManifestStore,
+    SemanticRouter, ToolCall, ToolExecutionResult, ToolExecutor, ToolManifestStore,
 };
 use aria_policy::CedarEvaluator;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,6 +44,7 @@ impl LLMBackend for MockDeveloperLLM {
         if n == 0 {
             // Round 1: request directory listing tool call
             Ok(LLMResponse::ToolCalls(vec![ToolCall {
+                invocation_id: None,
                 name: "list_directory".into(),
                 arguments: r#"{"path": "/workspace"}"#.into(),
             }]))
@@ -65,9 +65,9 @@ struct MockWasmExecutor;
 
 #[async_trait::async_trait]
 impl ToolExecutor for MockWasmExecutor {
-    async fn execute(&self, call: &ToolCall) -> Result<String, OrchestratorError> {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolExecutionResult, OrchestratorError> {
         match call.name.as_str() {
-            "list_directory" => Ok("file1.txt, file2.rs".into()),
+            "list_directory" => Ok(ToolExecutionResult::text("file1.txt, file2.rs")),
             other => Err(OrchestratorError::ToolError(format!(
                 "unknown tool: {}",
                 other
@@ -121,6 +121,11 @@ async fn full_pipeline_mocked() {
         name: "list_directory".into(),
         description: "List files in a directory".into(),
         parameters_schema: r#"{"path": "string"}"#.into(),
+        embedding: Vec::new(),
+        requires_strict_schema: false,
+        streaming_safe: false,
+        parallel_safe: true,
+        modalities: vec![aria_core::ToolModality::Text],
     }];
 
     let final_answer = orchestrator
@@ -189,6 +194,7 @@ async fn pipeline_infinite_loop_prevention() {
             _tools: &[CachedTool],
         ) -> Result<LLMResponse, OrchestratorError> {
             Ok(LLMResponse::ToolCalls(vec![ToolCall {
+                invocation_id: None,
                 name: "list_directory".into(),
                 arguments: "{}".into(),
             }]))
@@ -364,6 +370,7 @@ async fn dynamic_tool_hotswap_integration_path() {
         ) -> Result<LLMResponse, OrchestratorError> {
             match self.step.fetch_add(1, Ordering::SeqCst) {
                 0 => Ok(LLMResponse::ToolCalls(vec![ToolCall {
+                    invocation_id: None,
                     name: "search_tool_registry".into(),
                     arguments: r#"{"query":"sensor telemetry read"}"#.into(),
                 }])),
@@ -373,6 +380,7 @@ async fn dynamic_tool_hotswap_integration_path() {
                         "hot-swap result should be reflected in prompt"
                     );
                     Ok(LLMResponse::ToolCalls(vec![ToolCall {
+                        invocation_id: None,
                         name: "read_sensor".into(),
                         arguments: r#"{"sensor":"imu"}"#.into(),
                     }]))
@@ -385,9 +393,9 @@ async fn dynamic_tool_hotswap_integration_path() {
     struct SensorExecutor;
     #[async_trait::async_trait]
     impl ToolExecutor for SensorExecutor {
-        async fn execute(&self, call: &ToolCall) -> Result<String, OrchestratorError> {
+        async fn execute(&self, call: &ToolCall) -> Result<ToolExecutionResult, OrchestratorError> {
             match call.name.as_str() {
-                "read_sensor" => Ok("imu=nominal".into()),
+                "read_sensor" => Ok(ToolExecutionResult::text("imu=nominal")),
                 other => Err(OrchestratorError::ToolError(format!(
                     "unexpected tool execution: {}",
                     other
@@ -406,6 +414,11 @@ async fn dynamic_tool_hotswap_integration_path() {
         name: "read_sensor".into(),
         description: "Read telemetry from on-device sensors".into(),
         parameters_schema: r#"{"sensor":"string"}"#.into(),
+        embedding: Vec::new(),
+        requires_strict_schema: false,
+        streaming_safe: false,
+        parallel_safe: true,
+        modalities: vec![aria_core::ToolModality::Text],
     });
     let mut cache = DynamicToolCache::new(8, 15);
     cache
@@ -413,6 +426,11 @@ async fn dynamic_tool_hotswap_integration_path() {
             name: "search_tool_registry".into(),
             description: "Search and hot-swap tools by semantic query".into(),
             parameters_schema: r#"{"query":"string"}"#.into(),
+            embedding: Vec::new(),
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
         })
         .expect("insert meta tool");
 
@@ -422,13 +440,25 @@ async fn dynamic_tool_hotswap_integration_path() {
         channel: GatewayChannel::Cli,
         user_id: "integration-user".into(),
         content: MessageContent::Text("check imu health".into()),
+        tool_runtime_policy: None,
         timestamp_us: 1_700_000_000_000_000,
     };
 
     let answer = orchestrator
-        .run_for_request_with_dynamic_tools(
-            "sys", &req, "", "", &mut cache, &registry, &embedder, 5, None, None,
-        )
+        .run_for_request_with_dynamic_tools(aria_intelligence::DynamicRunContext {
+            agent_system_prompt: "sys",
+            request: &req,
+            history_context: "",
+            rag_context: "",
+            prompt_tools: None,
+            cache: &mut cache,
+            tool_registry: &registry,
+            embedder: &embedder,
+            max_tool_rounds: 5,
+            model_capability: None,
+            steering_rx: None,
+            global_estop: None,
+        })
         .await
         .expect("dynamic hot-swap flow should succeed");
 

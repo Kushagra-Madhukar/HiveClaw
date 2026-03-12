@@ -15,7 +15,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use aria_core::{AgentRequest, AgentResponse, AriaError};
+use aria_core::{
+    AgentRequest, AgentResponse, AriaError, RobotStateSnapshot, RoboticsCommandContract,
+    RoboticsSafetyEvent,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -34,6 +37,9 @@ pub mod topics {
     pub const ANNOUNCE_PATTERN: &str = "aria/node/*/announce";
     pub const COAST_MODE: &str = "aria/orchestrator/coast";
     pub const CONSTRAINT_VIOLATION: &str = "aria/safety/constraint_violation";
+    pub const ROBOT_COMMAND_PATTERN: &str = "aria/robot/*/command";
+    pub const ROBOT_STATE_PATTERN: &str = "aria/robot/*/state";
+    pub const ROBOT_SAFETY_PATTERN: &str = "aria/robot/*/safety";
 
     pub fn gateway_inbound(channel: &str) -> String {
         format!("aria/gateway/{}/inbound", channel)
@@ -49,6 +55,15 @@ pub mod topics {
     }
     pub fn announce(node_id: &str) -> String {
         format!("aria/node/{}/announce", node_id)
+    }
+    pub fn robot_command(robot_id: &str) -> String {
+        format!("aria/robot/{}/command", robot_id)
+    }
+    pub fn robot_state(robot_id: &str) -> String {
+        format!("aria/robot/{}/state", robot_id)
+    }
+    pub fn robot_safety(robot_id: &str) -> String {
+        format!("aria/robot/{}/safety", robot_id)
     }
 }
 
@@ -334,12 +349,14 @@ impl ZenohRouter {
             NodeRole::Orchestrator => true,
             NodeRole::Companion => {
                 topic.starts_with("aria/gateway/")
+                    || topic.starts_with("aria/robot/")
                     || topic.contains("/announce")
                     || topic.contains("/heartbeat")
                     || topic.contains("/result")
             }
             NodeRole::Relay | NodeRole::Micro => {
                 topic.starts_with("aria/skill/")
+                    || topic.starts_with("aria/robot/")
                     || topic.contains("/heartbeat")
                     || topic.starts_with(topics::CONSTRAINT_VIOLATION)
             }
@@ -527,6 +544,59 @@ impl ZenohRouter {
         Ok(())
     }
 
+    pub async fn publish_robot_command(
+        &self,
+        command: &RoboticsCommandContract,
+    ) -> Result<(), MeshError> {
+        let topic = topics::robot_command(&command.robot_id);
+        self.check_acl(&topic)?;
+        self.publish(&topic, command).await
+    }
+
+    pub async fn publish_robot_state(
+        &self,
+        snapshot: &RobotStateSnapshot,
+    ) -> Result<(), MeshError> {
+        let topic = topics::robot_state(&snapshot.robot_id);
+        self.check_acl(&topic)?;
+        self.publish(&topic, snapshot).await
+    }
+
+    pub async fn publish_robot_safety_event(
+        &self,
+        robot_id: &str,
+        event: &RoboticsSafetyEvent,
+    ) -> Result<(), MeshError> {
+        let topic = topics::robot_safety(robot_id);
+        self.check_acl(&topic)?;
+        self.publish(&topic, event).await
+    }
+
+    pub async fn subscribe_robot_states(
+        &self,
+        buffer_size: usize,
+    ) -> Result<mpsc::Receiver<RobotStateSnapshot>, MeshError> {
+        let (tx, rx) = mpsc::channel(buffer_size);
+        let subscriber = self
+            .session
+            .declare_subscriber(topics::ROBOT_STATE_PATTERN)
+            .await
+            .map_err(|e| MeshError::ZenohError(format!("subscribe robot state: {}", e)))?;
+
+        tokio::spawn(async move {
+            while let Ok(sample) = subscriber.recv_async().await {
+                let payload_bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
+                if let Ok(snapshot) = serde_json::from_slice::<RobotStateSnapshot>(&payload_bytes) {
+                    if tx.send(snapshot).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
     /// Get a reference to the underlying Zenoh session.
     pub fn session(&self) -> &Arc<zenoh::Session> {
         &self.session
@@ -555,7 +625,8 @@ mod tests {
     use super::*;
     use aria_core::{
         AgentRequest, AgentResponse, GatewayChannel, MessageContent, PolicyDecision,
-        SkillExecutionRecord,
+        RobotStateSnapshot, RoboticsCommandContract, RoboticsExecutionMode, RoboticsIntentKind,
+        RoboticsSafetyEvent, SkillExecutionRecord,
     };
     use std::time::Duration;
 
@@ -572,6 +643,7 @@ mod tests {
             channel: GatewayChannel::Telegram,
             user_id: String::from("test_user"),
             content: MessageContent::Text(String::from("hello mesh")),
+            tool_runtime_policy: None,
             timestamp_us: 1_700_000_000_000_000,
         }
     }
@@ -843,6 +915,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn topic_schema_robotics_topics() {
+        assert_eq!(
+            topics::robot_command("rover-1"),
+            "aria/robot/rover-1/command"
+        );
+        assert_eq!(topics::robot_state("rover-1"), "aria/robot/rover-1/state");
+        assert_eq!(topics::robot_safety("rover-1"), "aria/robot/rover-1/safety");
+    }
+
     // =====================================================================
     // HeartbeatMonitor unit tests
     // =====================================================================
@@ -984,5 +1066,68 @@ mod tests {
 
         router_pub.close().await.ok();
         router_sub.close().await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn robot_state_pub_sub_round_trip() {
+        let router_pub = ZenohRouter::new(MeshConfig::default())
+            .await
+            .expect("pub router");
+        let router_sub = ZenohRouter::new(MeshConfig::default())
+            .await
+            .expect("sub router");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut rx = router_sub
+            .subscribe_robot_states(8)
+            .await
+            .expect("subscribe robot states");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let snapshot = RobotStateSnapshot {
+            robot_id: "rover-1".into(),
+            battery_percent: 87,
+            active_faults: vec![],
+            degraded_local_mode: false,
+            last_heartbeat_us: 123,
+        };
+        router_pub
+            .publish_robot_state(&snapshot)
+            .await
+            .expect("publish robot state");
+
+        let received = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+
+        assert_eq!(received, snapshot);
+
+        router_pub.close().await.ok();
+        router_sub.close().await.ok();
+    }
+
+    #[test]
+    fn robotics_payloads_serialize_for_mesh_transport() {
+        let command = RoboticsCommandContract {
+            intent_id: make_uuid(),
+            robot_id: "rover-1".into(),
+            requested_by_agent: "robotics_ctrl".into(),
+            kind: RoboticsIntentKind::InspectActuator,
+            actuator_id: Some(2),
+            target_velocity: None,
+            reason: "inspection".into(),
+            execution_mode: RoboticsExecutionMode::Hardware,
+            timestamp_us: 88,
+        };
+        let safety = RoboticsSafetyEvent::CoastModeActivated {
+            robot_id: "rover-1".into(),
+            reason: "orchestrator timeout".into(),
+            timestamp_us: 99,
+        };
+        assert!(serde_json::to_vec(&command).is_ok());
+        assert!(serde_json::to_vec(&safety).is_ok());
     }
 }

@@ -1,7 +1,10 @@
-use aria_core::{AgentRequest, GatewayChannel};
+use aria_core::{AgentRequest, GatewayChannel, InboundEnvelope};
 use serde::Deserialize;
 
-use crate::{normalizer::build_text_request, GatewayError};
+use crate::{
+    normalizer::{build_text_envelope, inbound_envelope_to_request},
+    GatewayError,
+};
 
 #[derive(Debug, Deserialize)]
 struct WhatsAppPayload {
@@ -14,10 +17,10 @@ struct WhatsAppPayload {
 pub struct WhatsAppNormalizer;
 
 impl WhatsAppNormalizer {
-    pub fn normalize(json: &str) -> Result<AgentRequest, GatewayError> {
+    pub fn normalize_envelope(json: &str) -> Result<InboundEnvelope, GatewayError> {
         let payload: WhatsAppPayload =
             serde_json::from_str(json).map_err(|e| GatewayError::ParseError(e.to_string()))?;
-        Ok(build_text_request(
+        Ok(build_text_envelope(
             GatewayChannel::WhatsApp,
             payload.user_id,
             payload.chat_id,
@@ -25,5 +28,9 @@ impl WhatsAppNormalizer {
             payload.text,
             payload.timestamp_us,
         ))
+    }
+
+    pub fn normalize(json: &str) -> Result<AgentRequest, GatewayError> {
+        Self::normalize_envelope(json).map(inbound_envelope_to_request)
     }
 }

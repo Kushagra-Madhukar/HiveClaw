@@ -35,6 +35,12 @@ jobs:
       
     - name: Run Workspace Tests
       run: cargo test --workspace --verbose
+
+    - name: Acceptance Gates
+      run: scripts/check-acceptance-gates.sh
+
+    - name: Architecture Stress Suite
+      run: scripts/run-stress-suite.sh
       
     - name: Clippy
       run: cargo clippy --workspace -- -D warnings

@@ -9,13 +9,42 @@ max_tool_rounds = 5
 policy_path = "../aria-policy/policies/default.cedar"
 
 [gateway]
-adapter = "cli" # or "telegram"
+adapter = "cli" # or "telegram" or "websocket"
+# Optional multi-adapter mode (preferred): when set, this list is used instead of `adapter`.
+# Example: adapters = ["cli", "telegram"]
+# adapters = ["cli"]
+# Onboarding CLI:
+#   cargo run -p aria-x -- channels list
+#   cargo run -p aria-x -- channels add websocket
+#   cargo run -p aria-x -- channels status
+#   cargo run -p aria-x -- channels remove websocket
+# Optional explicit cross-channel fanout:
+# [[gateway.fanout]]
+# source = "telegram"
+# destination = "websocket"
+# enabled = true
+# Session scope policy:
+# main = keep provider-native session ids
+# peer = share one session per user across channels
+# channel_peer = share per user within a channel
+# account_channel_peer = isolate by original provider session/chat + channel + user
+# session_scope_policy = "main"
 # For adapter=telegram (resolution order: config → env → file):
 # telegram_token = ""           # Inline token, or...
 # telegram_token_file = ""      # Path to file (e.g. /run/secrets/telegram_token)
 # telegram_port = 8080          # Webhook listen port (only if telegram_mode = webhook)
 # telegram_mode = "polling"     # polling = no webhook (default). webhook = needs public URL
 # Env: TELEGRAM_BOT_TOKEN. Also load from .env or ~/.aria/.env
+# stt_backend = "local_whisper" # local_whisper | cloud_http
+# stt_cloud_fallback = false    # if true, fallback to cloud STT on local failure
+# stt_cloud_endpoint = ""       # required for cloud_http or fallback (JSON API)
+# stt_cloud_api_key_env = "OPENAI_API_KEY"
+# websocket_bind_address = "127.0.0.1" # WebSocket server bind address
+# websocket_port = 8090                # WebSocket server port
+# whatsapp_bind_address = "127.0.0.1"  # WhatsApp webhook bind address
+# whatsapp_port = 8091                 # WhatsApp webhook port
+# whatsapp_outbound_url = ""           # Optional outbound provider endpoint
+# whatsapp_auth_token = ""             # Optional bearer token for outbound API
 
 [mesh]
 mode = "peer"              # "peer" or "client"
@@ -30,6 +59,9 @@ tie_break_gap = 0.05
 
 [ssmu]
 sessions_dir = "../workspace/sessions"
+# Operator-data retention limits (0 disables pruning for that table).
+operator_skill_signature_max_rows = 5000
+operator_shell_exec_audit_max_rows = 20000
 
 [scheduler]
 enabled = false
@@ -39,7 +71,7 @@ tick_seconds = 1
 #id = "daily-standup"
 #agent_id = "productivity"
 #prompt = "Generate my standup from yesterday's commits."
-#schedule = "every:3600s"
+#schedule = "daily@09:00#Asia/Kolkata"
 
 [localization]
 # Fallback timezone for users not listed below. Must be an IANA timezone.
@@ -50,8 +82,23 @@ user_timezones = {}
 
 [node]
 id = "orchestrator-1"
-role = "orchestrator"      # "orchestrator" | "relay" | "companion" | "micro"
+role = "orchestrator"      # "orchestrator" | "combined" | "ingress" | "outbound" | "scheduler"
 tier = "orchestrator"
+
+[cluster]
+# edge | node | cluster
+profile = "node"
+# sqlite stays the default even for low-end devices. postgres is optional for cluster installs.
+runtime_store_backend = "sqlite"
+# postgres_url = "postgres://aria:secret@localhost/aria"
+tenant_id = "default"
+workspace_scope = "default"
+scheduler_shards = 1
+
+[rollout]
+canary_enabled = false
+allowed_node_ids = []
+enabled_features = []
 
 [simulator]
 enabled = false

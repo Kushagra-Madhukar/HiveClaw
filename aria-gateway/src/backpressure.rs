@@ -58,6 +58,7 @@ mod tests {
             channel: GatewayChannel::Cli,
             user_id: "u1".into(),
             content: MessageContent::Text(text.into()),
+            tool_runtime_policy: None,
             timestamp_us: 1,
         }
     }

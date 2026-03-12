@@ -55,6 +55,57 @@ mod tests {
         let req = TelegramNormalizer::normalize(payload).expect("normalize");
         assert_eq!(req.channel, GatewayChannel::Telegram);
         assert_eq!(req.content, MessageContent::Text("Hello ARIA!".into()));
+        let envelope = TelegramNormalizer::normalize_envelope(payload).expect("envelope");
+        assert_eq!(envelope.provider_message_id.as_deref(), Some("123456789"));
+        assert_eq!(envelope.channel, GatewayChannel::Telegram);
+    }
+
+    #[test]
+    fn normalize_telegram_voice_to_audio_content() {
+        let payload = r#"{
+            "update_id": 123456790,
+            "message": {
+                "message_id": 43,
+                "from": {"id": 99887766, "first_name": "Alice"},
+                "chat": {"id": 42, "type": "private"},
+                "voice": {"file_id": "voice-file-id"},
+                "date": 1709500001
+            }
+        }"#;
+        let req = TelegramNormalizer::normalize(payload).expect("normalize");
+        assert_eq!(req.channel, GatewayChannel::Telegram);
+        assert_eq!(
+            req.content,
+            MessageContent::Audio {
+                url: "voice-file-id".into(),
+                transcript: None
+            }
+        );
+    }
+
+    #[test]
+    fn normalize_telegram_video_to_video_content() {
+        let payload = r#"{
+            "update_id": 123456791,
+            "message": {
+                "message_id": 44,
+                "from": {"id": 99887766, "first_name": "Alice"},
+                "chat": {"id": 42, "type": "private"},
+                "caption": "check this clip",
+                "video": {"file_id": "video-file-id"},
+                "date": 1709500002
+            }
+        }"#;
+        let req = TelegramNormalizer::normalize(payload).expect("normalize");
+        assert_eq!(req.channel, GatewayChannel::Telegram);
+        assert_eq!(
+            req.content,
+            MessageContent::Video {
+                url: "video-file-id".into(),
+                caption: Some("check this clip".into()),
+                transcript: None
+            }
+        );
     }
 
     #[test]
@@ -64,6 +115,9 @@ mod tests {
         let req = WhatsAppNormalizer::normalize(payload).unwrap();
         assert_eq!(req.channel, GatewayChannel::WhatsApp);
         assert_eq!(req.content, MessageContent::Text("ping".into()));
+        let env = WhatsAppNormalizer::normalize_envelope(payload).unwrap();
+        assert_eq!(env.channel, GatewayChannel::WhatsApp);
+        assert_eq!(env.provider_message_id.as_deref(), Some("42"));
     }
 
     #[test]
@@ -99,6 +153,9 @@ mod tests {
         let req = CliNormalizer::normalize_line("cli_user", 99, "hello", 1);
         assert_eq!(req.channel, GatewayChannel::Cli);
         assert_eq!(req.content, MessageContent::Text("hello".into()));
+        let env = CliNormalizer::normalize_line_envelope("cli_user", 99, "hello", 1);
+        assert_eq!(env.channel, GatewayChannel::Cli);
+        assert_eq!(env.provider_message_id.as_deref(), Some("99"));
     }
 
     #[test]

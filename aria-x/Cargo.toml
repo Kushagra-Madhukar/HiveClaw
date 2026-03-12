@@ -4,12 +4,21 @@ version = "0.1.0"
 edition = "2021"
 description = "ARIA-X orchestrator binary — wires all crates into the final agent runtime"
 
+[features]
+default = ["standard-runtime"]
+standard-runtime = ["mcp-runtime", "speech-runtime"]
+low-end-device = []
+mcp-runtime = ["dep:aria-mcp"]
+speech-runtime = []
+
 [[bin]]
 name = "aria-x"
 path = "src/main.rs"
 
 [dependencies]
 aria-core = { path = "../aria-core" }
+aria-mcp = { path = "../aria-mcp", optional = true }
+aria-learning = { path = "../aria-learning" }
 aria-policy = { path = "../aria-policy" }
 aria-skill-runtime = { path = "../aria-skill-runtime" }
 aria-ssmu = { path = "../aria-ssmu" }
@@ -17,25 +26,41 @@ aria-intelligence = { path = "../aria-intelligence" }
 aria-gateway = { path = "../aria-gateway" }
 aria-safety = { path = "../aria-safety" }
 aria-vault = { path = "../aria-vault" }
-axum = { version = "0.7", features = ["json", "macros"] }
+axum = { version = "0.7", features = ["json", "macros", "ws"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_path_to_error = "0.1"
 toml = "0.8"
 dotenvy = "0.15"
+figment = { version = "0.10", features = ["env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 dashmap = "6.1.0"
+moka = { version = "0.12", features = ["sync"] }
 hex = "0.4"
 cron = "0.15.0"
 chrono = "0.4.44"
 chrono-tz = "0.10"
 iana-time-zone = "0.1"
 toml_edit = "0.25.4"
+base64 = "0.22"
+rusqlite = "0.33"
+sha2 = "0.10"
+ed25519-dalek = { version = "2.2", features = ["std"] }
+aes-gcm = "0.10.3"
+scraper = "0.20"
+governor = { version = "0.6", features = ["std", "dashmap", "futures"] }
+infer = "0.16"
+directories = "5"
+futures-util = "0.3"
+crossterm = "0.28"
+tokio-tungstenite = "0.28"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"

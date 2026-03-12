@@ -1,0 +1,20 @@
+name: Documentation Guardrails
+
+on:
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  docs-gate:
+    name: Documentation Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run documentation guardrail check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash scripts/check-doc-guardrails.sh

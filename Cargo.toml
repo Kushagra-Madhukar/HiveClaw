@@ -1,11 +1,13 @@
 [workspace]
 members = [
     "aria-core",
+    "aria-mcp",
     "aria-mesh",
     "aria-policy",
     "aria-skill-runtime",
     "aria-ssmu",
     "aria-intelligence",
+    "aria-learning",
     "aria-gateway",
     "aria-x", "aria-safety", "aria-vault",
 ]

@@ -336,12 +336,27 @@ impl CedarEvaluator {
         resource: &str,
         ctx: &EvalContext,
     ) -> Result<Decision, PolicyError> {
+        self.evaluate_with_context_and_path(principal, action, resource, resource, ctx)
+    }
+
+    /// Evaluate with extra runtime context attributes and an explicit resource path.
+    ///
+    /// `resource` is the stable entity identifier used for the Cedar request,
+    /// while `resource_path` is exposed to policies as `resource.path`.
+    pub fn evaluate_with_context_and_path(
+        &self,
+        principal: &str,
+        action: &str,
+        resource: &str,
+        resource_path: &str,
+        ctx: &EvalContext,
+    ) -> Result<Decision, PolicyError> {
         // --- Whitelist/Forbid Path Check ---
         // If resource is "global" or "agent", we skip path-based checks.
-        if resource != "global" && resource != "agent" {
+        if resource_path != "global" && resource_path != "agent" {
             // Check forbidden prefixes first (explicit deny)
             for f in &ctx.forbid {
-                if resource.starts_with(f) {
+                if resource_path.starts_with(f) {
                     return Ok(Decision::Deny);
                 }
             }
@@ -349,7 +364,7 @@ impl CedarEvaluator {
             // Check whitelisted prefixes (implicit allow zone)
             let mut whitelisted = false;
             for w in &ctx.whitelist {
-                if resource.starts_with(w) {
+                if resource_path.starts_with(w) {
                     whitelisted = true;
                     break;
                 }
@@ -358,9 +373,11 @@ impl CedarEvaluator {
             // If it's a path-based resource and not in a whitelisted zone, deny.
             // We assume resources containing '/' or starting with './' or '../' are paths.
             if !whitelisted
-                && (resource.contains('/')
-                    || resource.starts_with('.')
-                    || !resource.chars().all(|c| c.is_alphanumeric() || c == '_'))
+                && (resource_path.contains('/')
+                    || resource_path.starts_with('.')
+                    || !resource_path
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_'))
             {
                 return Ok(Decision::Deny);
             }
@@ -379,7 +396,7 @@ impl CedarEvaluator {
         let mut context_map = HashMap::new();
         context_map.insert(
             "path".to_string(),
-            cedar_policy::RestrictedExpression::new_string(resource.to_string()),
+            cedar_policy::RestrictedExpression::new_string(resource_path.to_string()),
         );
         context_map.insert(
             "channel".to_string(),
@@ -402,7 +419,7 @@ impl CedarEvaluator {
                 let mut attrs = HashMap::new();
                 attrs.insert(
                     "path".to_string(),
-                    cedar_policy::RestrictedExpression::new_string(resource.to_string()),
+                    cedar_policy::RestrictedExpression::new_string(resource_path.to_string()),
                 );
                 attrs
             },
@@ -423,6 +440,44 @@ impl CedarEvaluator {
             cedar_policy::Decision::Allow => Ok(Decision::Allow),
             cedar_policy::Decision::Deny => Ok(Decision::Deny),
         }
+    }
+
+    /// Context-aware tri-state evaluation: `Allow`, `Deny`, or `AskUser`.
+    ///
+    /// If the context-aware evaluation allows an action that is marked
+    /// sensitive, the decision is upgraded to `AskUser`.
+    pub fn evaluate_with_context_tristate(
+        &self,
+        principal: &str,
+        action: &str,
+        resource: &str,
+        ctx: &EvalContext,
+        sensitive_actions: &[&str],
+    ) -> Result<Decision, PolicyError> {
+        let base =
+            self.evaluate_with_context_and_path(principal, action, resource, resource, ctx)?;
+        if base == Decision::Allow && sensitive_actions.contains(&action) {
+            return Ok(Decision::AskUser);
+        }
+        Ok(base)
+    }
+
+    /// Context-aware tri-state evaluation with an explicit semantic resource path.
+    pub fn evaluate_with_context_and_path_tristate(
+        &self,
+        principal: &str,
+        action: &str,
+        resource: &str,
+        resource_path: &str,
+        ctx: &EvalContext,
+        sensitive_actions: &[&str],
+    ) -> Result<Decision, PolicyError> {
+        let base =
+            self.evaluate_with_context_and_path(principal, action, resource, resource_path, ctx)?;
+        if base == Decision::Allow && sensitive_actions.contains(&action) {
+            return Ok(Decision::AskUser);
+        }
+        Ok(base)
     }
 
     /// Hot-reload policy from a new source string without restarting.
@@ -875,10 +930,9 @@ mod tests {
 
     #[test]
     fn parse_ast_action_handles_multiline_quoted_values() {
-        let parsed = parse_ast_action(
-            "schedule_message(task=\"Line1\nLine2, Name: Alex\", delay=\"1m\")",
-        )
-        .expect("parse");
+        let parsed =
+            parse_ast_action("schedule_message(task=\"Line1\nLine2, Name: Alex\", delay=\"1m\")")
+                .expect("parse");
         assert_eq!(
             parsed.arguments.get("task"),
             Some(&"Line1\nLine2, Name: Alex".to_string())

@@ -13,6 +13,8 @@ aria-core = { path = "../aria-core" }
 ed25519-dalek = { version = "2.2", features = ["std"] }
 extism = "1.13"
 serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [dev-dependencies]
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+tempfile = "3"
