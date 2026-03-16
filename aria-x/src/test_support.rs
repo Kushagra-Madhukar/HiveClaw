@@ -665,12 +665,12 @@ mod tests {
             resolved_at_us: None,
         };
         let rendered = render_approval_prompt_for_channel(&record, Some("apv-ABC123"));
-        assert_eq!(rendered.parse_mode, Some("Markdown"));
+        assert_eq!(rendered.parse_mode, None);
         let keyboard = rendered
             .reply_markup
             .expect("telegram should include inline keyboard");
         assert!(keyboard["inline_keyboard"].is_array());
-        assert!(rendered.text.contains("Approval Required"));
+        assert!(rendered.text.contains("Approval required"));
         let callback_data = keyboard["inline_keyboard"][0][0]["callback_data"]
             .as_str()
             .expect("callback data");
@@ -696,7 +696,7 @@ mod tests {
         let rendered = render_approval_prompt_for_channel(&record, None);
         assert_eq!(rendered.parse_mode, None);
         assert!(rendered.reply_markup.is_none());
-        assert!(rendered.text.contains("Approval Required"));
+        assert!(rendered.text.contains("Approval required"));
     }
 
     #[tokio::test]
@@ -4153,6 +4153,51 @@ mod tests {
                 timezone: chrono_tz::UTC
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn manage_cron_empty_schedule_object_falls_back_to_classified_schedule() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<aria_intelligence::CronCommand>(2);
+        let (job_tx, job_rx) =
+            tokio::sync::oneshot::channel::<aria_intelligence::ScheduledPromptJob>();
+        tokio::spawn(async move {
+            if let Some(aria_intelligence::CronCommand::Add(job)) = rx.recv().await {
+                let _ = job_tx.send(job);
+            }
+        });
+
+        let exec = NativeToolExecutor {
+            tx_cron: tx,
+            invoking_agent_id: Some("planner".into()),
+            session_id: Some(*uuid::Uuid::new_v4().as_bytes()),
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Telegram),
+            session_memory: None,
+            cedar: None,
+            sessions_dir: None,
+            scheduling_intent: Some(SchedulingIntent {
+                mode: SchedulingMode::Defer,
+                normalized_schedule: Some(ToolSchedule::At {
+                    at: "2026-03-13T11:32:00+00:00".into(),
+                }),
+                deferred_task: Some("Time to sleep".into()),
+                rationale: "test intent",
+            }),
+            user_timezone: chrono_tz::UTC,
+        };
+
+        let result = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "manage_cron".into(),
+                arguments: r#"{"action":"add","prompt":"Time to sleep!","schedule":"{}","agent_id":"planner"}"#.into(),
+            })
+            .await
+            .expect("manage_cron should recover from empty schedule object");
+
+        assert!(result.contains("Cron"));
+        let job = job_rx.await.expect("expected Add job command");
+        assert!(matches!(job.schedule, aria_intelligence::ScheduleSpec::Once(_)));
     }
 
     #[test]
@@ -13875,6 +13920,16 @@ exit 0
     }
 
     #[test]
+    fn classify_scheduling_intent_prefers_notify_for_inform_me() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-03-06T20:44:29+05:30")
+            .expect("rfc3339")
+            .with_timezone(&chrono_tz::Asia::Kolkata);
+        let intent = classify_scheduling_intent("Inform me to go to office in 2 minutes", now)
+            .expect("expected scheduling intent");
+        assert_eq!(intent.mode, SchedulingMode::Notify);
+    }
+
+    #[test]
     fn classify_scheduling_intent_detects_now_plus_later_as_both() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-03-06T20:44:29+05:30")
             .expect("rfc3339")
@@ -16402,6 +16457,23 @@ exit 0
         crate::outbound::unregister_websocket_recipient("ws-user");
     }
 
+    #[test]
+    fn resolve_outbound_recipient_id_prefers_numeric_user_for_telegram() {
+        let req = AgentRequest {
+            request_id: [7; 16],
+            session_id: [8; 16],
+            channel: GatewayChannel::Telegram,
+            user_id: "123456789".into(),
+            content: MessageContent::Text("hello".into()),
+            tool_runtime_policy: None,
+            timestamp_us: 1,
+        };
+        assert_eq!(
+            resolve_outbound_recipient_id(&req, GatewayChannel::Telegram),
+            "123456789"
+        );
+    }
+
     #[tokio::test]
     async fn retry_failed_outbound_deliveries_worker_recovers_websocket_delivery() {
         let sessions = tempfile::tempdir().expect("sessions");
@@ -17757,9 +17829,57 @@ exit 0
             .await
             .expect("schedule should use classifier schedule");
 
-        assert!(result.contains("notify + deferred execution"));
+        assert!(result.contains("Scheduled reminder notification"));
         let job = job_rx.await.expect("expected Add job");
         assert_eq!(job.schedule_str, "at:2026-03-06T20:45:00+00:00");
+        assert_eq!(job.kind, aria_intelligence::ScheduledJobKind::Notify);
+    }
+
+    #[tokio::test]
+    async fn schedule_message_notify_intent_does_not_auto_enqueue_deferred_job() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<aria_intelligence::CronCommand>(2);
+        let (job_tx, job_rx) =
+            tokio::sync::oneshot::channel::<aria_intelligence::ScheduledPromptJob>();
+        tokio::spawn(async move {
+            if let Some(aria_intelligence::CronCommand::List(reply)) = rx.recv().await {
+                let _ = reply.send(Vec::new());
+            }
+            if let Some(aria_intelligence::CronCommand::Add(job)) = rx.recv().await {
+                let _ = job_tx.send(job);
+            }
+        });
+        let exec = NativeToolExecutor {
+            tx_cron: tx,
+            invoking_agent_id: Some("planner".into()),
+            session_id: Some(*uuid::Uuid::new_v4().as_bytes()),
+            user_id: Some("123456".into()),
+            channel: Some(GatewayChannel::Telegram),
+            session_memory: None,
+            cedar: None,
+            sessions_dir: None,
+            scheduling_intent: Some(SchedulingIntent {
+                mode: SchedulingMode::Notify,
+                normalized_schedule: Some(ToolSchedule::At {
+                    at: "2026-03-07T02:15:00+05:30".into(),
+                }),
+                deferred_task: Some("Go to office".into()),
+                rationale: "explicit reminder language",
+            }),
+            user_timezone: chrono_tz::Asia::Kolkata,
+        };
+
+        let result = exec
+            .execute(&ToolCall { invocation_id: None,
+                name: "schedule_message".into(),
+                arguments: r#"{"task":"Go to office","agent_id":"planner"}"#.into(),
+            })
+            .await
+            .expect("notify intent should stay notify");
+
+        assert!(result.contains("Scheduled reminder notification"));
+        let job = job_rx.await.expect("expected Add job");
+        assert_eq!(job.kind, aria_intelligence::ScheduledJobKind::Notify);
+        assert_eq!(job.prompt, "Go to office");
     }
 
     #[tokio::test]
@@ -18283,6 +18403,8 @@ exit 0
                     channel: aria_core::GatewayChannel::Cli,
                     execution_contract: None,
                     retrieved_context: None,
+            working_set: None,
+            context_plan: None,
                 },
                 rendered_prompt: "rendered".into(),
                 created_at_us: 1,
@@ -18363,6 +18485,8 @@ exit 0
                     channel: aria_core::GatewayChannel::Cli,
                     execution_contract: None,
                     retrieved_context: None,
+            working_set: None,
+            context_plan: None,
                 },
                 rendered_prompt: "rendered".into(),
                 created_at_us: 1,
@@ -18444,6 +18568,8 @@ exit 0
                     channel: aria_core::GatewayChannel::Cli,
                     execution_contract: None,
                     retrieved_context: None,
+            working_set: None,
+            context_plan: None,
                 },
                 rendered_prompt: "rendered".into(),
                 created_at_us: 1,
@@ -18916,6 +19042,10 @@ exit 0
             &req,
             "Use browser_act to click selector \"body\" using the active browser session.",
             None,
+            &resolve_execution_contract(
+                "Use browser_act to click selector \"body\" using the active browser session.",
+                None,
+            ),
         )
         .expect("browser action policy");
         assert_eq!(
@@ -19166,6 +19296,17 @@ exit 0
         );
         assert!(tools.contains(&"set_reminder"));
         assert!(tools.contains(&"schedule_message"));
+        assert!(!tools.contains(&"manage_cron"));
+    }
+
+    #[test]
+    fn contextual_runtime_tool_names_include_manage_cron_for_explicit_cron_management() {
+        let tools = contextual_runtime_tool_names_for_request(
+            "productivity",
+            "Manage cron: list jobs and delete cron reminders",
+        );
+        assert!(tools.contains(&"set_reminder"));
+        assert!(tools.contains(&"schedule_message"));
         assert!(tools.contains(&"manage_cron"));
     }
 
@@ -19188,9 +19329,13 @@ exit 0
             &req,
             "Set a reminder in 2 minutes",
             Some(&scheduling_intent),
+            &resolve_execution_contract("Set a reminder in 2 minutes", Some(&scheduling_intent)),
         )
         .expect("policy");
-        assert_eq!(policy.tool_choice, aria_core::ToolChoicePolicy::Required);
+        assert_eq!(
+            policy.tool_choice,
+            aria_core::ToolChoicePolicy::Specific("schedule_message".into())
+        );
         assert!(!policy.allow_parallel_tool_calls);
     }
 
@@ -19213,9 +19358,13 @@ exit 0
             &req,
             "Do this in 2 minutes",
             Some(&scheduling_intent),
+            &resolve_execution_contract("Do this in 2 minutes", Some(&scheduling_intent)),
         )
         .expect("policy");
-        assert_eq!(policy.tool_choice, aria_core::ToolChoicePolicy::Required);
+        assert_eq!(
+            policy.tool_choice,
+            aria_core::ToolChoicePolicy::Specific("schedule_message".into())
+        );
         assert!(!policy.allow_parallel_tool_calls);
     }
 

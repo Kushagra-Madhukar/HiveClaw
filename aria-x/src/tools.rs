@@ -1148,17 +1148,20 @@ impl ToolExecutor for NativeToolExecutor {
                     .unwrap_or("notify")
                     .trim()
                     .to_ascii_lowercase();
-                let deferred_prompt = request
+                let explicit_deferred_prompt = request
                     .deferred_prompt
                     .as_deref()
                     .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        self.scheduling_intent
-                            .as_ref()
-                            .and_then(|intent| intent.deferred_task.clone())
-                    });
-                let mode = if deferred_prompt.is_some() && mode == "notify" {
+                    .filter(|s| !s.is_empty());
+                let inferred_deferred_prompt = if mode == "notify" {
+                    None
+                } else {
+                    self.scheduling_intent
+                        .as_ref()
+                        .and_then(|intent| intent.deferred_task.clone())
+                };
+                let deferred_prompt = explicit_deferred_prompt.clone().or(inferred_deferred_prompt);
+                let mode = if explicit_deferred_prompt.is_some() && mode == "notify" {
                     "both".to_string()
                 } else {
                     mode
@@ -2738,11 +2741,16 @@ impl ToolExecutor for NativeToolExecutor {
                         self.invoking_agent_id.as_deref(),
                         "this cron job",
                     )?;
+                    let classified_schedule = self
+                        .scheduling_intent
+                        .as_ref()
+                        .and_then(|intent| intent.normalized_schedule.clone());
                     let schedule_input = parse_tool_schedule_value(
                         request.schedule.as_ref(),
                         self.user_timezone,
                         "schedule",
                     )?
+                    .or(classified_schedule)
                     .ok_or_else(|| OrchestratorError::ToolError("Missing 'schedule' object".into()))?;
 
                     if prompt.is_empty() {
@@ -5441,6 +5449,7 @@ struct PolicyCheckedExecutor<T: ToolExecutor> {
     sessions_dir: Option<PathBuf>,
     session_id: Option<aria_core::Uuid>,
     firewall: Option<aria_safety::DfaFirewall>,
+    workspace_lock_key: String,
 }
 
 impl<T: ToolExecutor> PolicyCheckedExecutor<T> {
@@ -5455,6 +5464,7 @@ impl<T: ToolExecutor> PolicyCheckedExecutor<T> {
         sessions_dir: Option<PathBuf>,
         session_id: Option<aria_core::Uuid>,
     ) -> Self {
+        let workspace_lock_key = resolve_workspace_lock_key(&principal, &whitelist);
         Self {
             inner,
             cedar,
@@ -5466,6 +5476,7 @@ impl<T: ToolExecutor> PolicyCheckedExecutor<T> {
             sessions_dir,
             session_id,
             firewall: None,
+            workspace_lock_key,
         }
     }
 
@@ -8201,13 +8212,19 @@ fn record_learning_reward(
 struct RecordingToolExecutor<T> {
     inner: T,
     executed_tools: Arc<std::sync::Mutex<Vec<String>>>,
+    executed_turns: Arc<std::sync::Mutex<Vec<ExecutedToolCall>>>,
 }
 
 impl<T> RecordingToolExecutor<T> {
-    fn new(inner: T, executed_tools: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+    fn new(
+        inner: T,
+        executed_tools: Arc<std::sync::Mutex<Vec<String>>>,
+        executed_turns: Arc<std::sync::Mutex<Vec<ExecutedToolCall>>>,
+    ) -> Self {
         Self {
             inner,
             executed_tools,
+            executed_turns,
         }
     }
 }
@@ -8216,12 +8233,21 @@ impl<T> RecordingToolExecutor<T> {
 impl<T: ToolExecutor> ToolExecutor for RecordingToolExecutor<T> {
     async fn execute(&self, call: &ToolCall) -> Result<ToolExecutionResult, OrchestratorError> {
         let result = self.inner.execute(call).await;
-        if result.is_ok() {
+        if let Ok(output) = &result {
             let mut guard = self
                 .executed_tools
                 .lock()
                 .expect("recording tool executor lock poisoned");
             guard.push(call.name.clone());
+            drop(guard);
+            let mut turns = self
+                .executed_turns
+                .lock()
+                .expect("recording tool turn executor lock poisoned");
+            turns.push(ExecutedToolCall {
+                call: call.clone(),
+                result: output.clone(),
+            });
         }
         result
     }
@@ -8422,6 +8448,36 @@ impl<T: ToolExecutor> ToolExecutor for PolicyCheckedExecutor<T> {
             return Err(aria_intelligence::approval_required_error(&call.name));
         }
         debug!(tool = %call.name, "PolicyCheckedExecutor: ALLOWED, delegating to executor");
+        let _workspace_guard = if tool_requires_workspace_lock(&call.name) {
+            Some(
+                workspace_lock_manager()
+                    .acquire(
+                        self.workspace_lock_key.clone(),
+                        format!(
+                            "session:{}:agent:{}:tool:{}",
+                            self.session_id
+                                .map(uuid::Uuid::from_bytes)
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| "unknown".to_string()),
+                            self.principal,
+                            call.name
+                        ),
+                    )
+                    .await
+                    .map_err(|err| {
+                        warn!(
+                            session_id = ?self.session_id.map(uuid::Uuid::from_bytes),
+                            workspace_key = %self.workspace_lock_key,
+                            tool = %call.name,
+                            error = %err,
+                            "workspace coordination rejected tool execution"
+                        );
+                        err
+                    })?,
+            )
+        } else {
+            None
+        };
         let result = self.inner.execute(call).await?;
         if let Some(firewall) = self.firewall.as_ref() {
             scan_web_tool_result(
@@ -9791,7 +9847,12 @@ fn classify_scheduling_intent(
     let has_reminder_words = lower.contains("remind")
         || lower.contains("reminder")
         || lower.contains("notify me")
-        || lower.contains("notification");
+        || lower.contains("notification")
+        || lower.contains("inform me")
+        || lower.contains("tell me")
+        || lower.contains("let me know")
+        || lower.contains("ping me")
+        || lower.contains("message me");
     let has_immediate_words = lower.contains(" now ")
         || lower.starts_with("now ")
         || lower.contains(" immediately")
@@ -10090,12 +10151,7 @@ async fn send_universal_response(req: &AgentRequest, text: &str, config: &Resolv
         }
     }
     for target_channel in targets {
-        let recipient_id = match target_channel {
-            aria_core::GatewayChannel::Telegram => {
-                i64::from_le_bytes(req.session_id[0..8].try_into().unwrap_or([0u8; 8])).to_string()
-            }
-            _ => req.user_id.clone(),
-        };
+        let recipient_id = resolve_outbound_recipient_id(req, target_channel);
         let mut envelope = envelope_from_text_response_with_correlation(
             req.session_id,
             target_channel,
@@ -10135,6 +10191,12 @@ async fn send_universal_response(req: &AgentRequest, text: &str, config: &Resolv
                     crate::channel_health::ChannelHealthEventKind::OutboundFailed,
                 );
                 let _ = store.record_outbound_delivery(&envelope, "failed", Some(&err));
+                warn!(
+                    channel = ?target_channel,
+                    recipient_id = %recipient_id,
+                    error = %err,
+                    "Universal response dispatch failed"
+                );
                 if config.cluster.is_cluster() {
                     let now_us = chrono::Utc::now().timestamp_micros() as u64;
                     let _ = store.enqueue_durable_message(&crate::runtime_store::DurableQueueMessage {
@@ -10158,6 +10220,23 @@ async fn send_universal_response(req: &AgentRequest, text: &str, config: &Resolv
             }
         };
         debug!(channel = ?target_channel, delivery_status = status, "Universal response dispatched");
+    }
+}
+
+fn resolve_outbound_recipient_id(
+    req: &AgentRequest,
+    target_channel: aria_core::GatewayChannel,
+) -> String {
+    match target_channel {
+        aria_core::GatewayChannel::Telegram => req
+            .user_id
+            .trim()
+            .parse::<i64>()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|_| {
+                i64::from_le_bytes(req.session_id[0..8].try_into().unwrap_or([0u8; 8])).to_string()
+            }),
+        _ => req.user_id.clone(),
     }
 }
 
@@ -11263,11 +11342,47 @@ fn prompt_is_low_information(request_text: &str) -> bool {
     first.is_some() && second.is_none() && request_text.trim().chars().count() <= 4
 }
 
+fn working_set_tool_bonus(
+    working_set: Option<&aria_core::WorkingSet>,
+    tool: &CachedTool,
+) -> f32 {
+    let Some(working_set) = working_set else {
+        return 0.0;
+    };
+    let active_entry = working_set
+        .active_target_entry_id
+        .as_ref()
+        .and_then(|entry_id| working_set.entries.iter().find(|entry| &entry.entry_id == entry_id))
+        .or_else(|| working_set.entries.first());
+    let Some(entry) = active_entry else {
+        return 0.0;
+    };
+    let mut bonus = 0.0;
+    if entry
+        .origin_tool
+        .as_ref()
+        .map(|origin| origin == &tool.name)
+        .unwrap_or(false)
+    {
+        bonus += 0.7;
+    }
+    if entry.artifact_kind == execution_artifact_kind_for_tool(&tool.name) {
+        bonus += 0.45;
+    }
+    if let Some(locator) = &entry.locator {
+        if tool.description.to_ascii_lowercase().contains(&locator.to_ascii_lowercase()) {
+            bonus += 0.2;
+        }
+    }
+    bonus
+}
+
 fn select_prompt_tool_window<E: EmbeddingModel>(
     request_text: &str,
     active_tools: &[CachedTool],
     tool_registry: &ToolManifestStore,
     embedder: &E,
+    working_set: Option<&aria_core::WorkingSet>,
     capability_profile: Option<&aria_core::ModelCapabilityProfile>,
     policy: Option<&aria_core::ToolRuntimePolicy>,
     allow_repair_fallback: bool,
@@ -11304,12 +11419,18 @@ fn select_prompt_tool_window<E: EmbeddingModel>(
         } else {
             ((index + 1) as f32 / prompt_candidates.len() as f32) * 0.05
         };
-        let score =
-            prompt_tool_score(request_text, tool, embedder, capability_profile) + recency_bonus;
+        let working_set_bonus = working_set_tool_bonus(working_set, tool);
+        let score = prompt_tool_score(request_text, tool, embedder, capability_profile)
+            + recency_bonus
+            + working_set_bonus;
         candidate_scores.push(aria_core::ToolSelectionScore {
             tool_name: tool.name.clone(),
             score: (score * 1000.0).round() as i32,
-            source: "active".into(),
+            source: if working_set_bonus > 0.0 {
+                "active_working_set".into()
+            } else {
+                "active".into()
+            },
         });
         ranked_candidates.push((tool.clone(), score));
     }
@@ -11324,11 +11445,16 @@ fn select_prompt_tool_window<E: EmbeddingModel>(
             if !entry.visibility.available {
                 continue;
             }
-            let score = entry.score.unwrap_or(f32::NEG_INFINITY);
+            let working_set_bonus = working_set_tool_bonus(working_set, &entry.tool);
+            let score = entry.score.unwrap_or(f32::NEG_INFINITY) + working_set_bonus;
             candidate_scores.push(aria_core::ToolSelectionScore {
                 tool_name: entry.tool.name.clone(),
                 score: (score * 1000.0).round() as i32,
-                source: "registry".into(),
+                source: if working_set_bonus > 0.0 {
+                    "registry_working_set".into()
+                } else {
+                    "registry".into()
+                },
             });
             if !seen.contains(&entry.tool.name) {
                 ranked_candidates.push((entry.tool, score));
@@ -11906,7 +12032,10 @@ fn contextual_runtime_tool_names_for_request(
 
     let scheduling_request = request_is_scheduling_like(&lower);
     if scheduling_request && matches!(agent_id, "productivity" | "omni" | "developer") {
-        tools.extend(["set_reminder", "schedule_message", "manage_cron"]);
+        tools.extend(["set_reminder", "schedule_message"]);
+        if request_is_cron_management_like(&lower) {
+            tools.push("manage_cron");
+        }
     }
 
     let mcp_request = [
@@ -11960,6 +12089,11 @@ fn contextual_runtime_tool_names_for_request(
     .any(|needle| lower.contains(needle));
     if remote_tool_request && matches!(agent_id, "omni" | "developer") {
         tools.push("register_remote_tool");
+    }
+    if request_is_file_modify_like(&lower)
+        && matches!(agent_id, "omni" | "developer" | "productivity")
+    {
+        tools.push("write_file");
     }
 
     tools
@@ -12147,6 +12281,193 @@ fn extract_first_path_from_text(request_text: &str) -> Option<String> {
                 .to_string()
         })
         .filter(|segment| segment.len() > 1)
+}
+
+fn extract_locator_from_tool_output(text: &str) -> Option<String> {
+    let marker = " to ";
+    let pos = text.rfind(marker)?;
+    let tail = text[pos + marker.len()..]
+        .trim()
+        .trim_end_matches("</TOOL_RESUME_BLOCK>")
+        .trim();
+    let candidate = tail
+        .split(['\n', '\r', ' ', ')'])
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| "\"'`<>[]{}(),.".contains(c));
+    if candidate.is_empty() {
+        None
+    } else {
+        Some(candidate.to_string())
+    }
+}
+
+fn extract_locator_from_tool_payload(payload: &serde_json::Value) -> Option<String> {
+    let object = payload.as_object()?;
+    for key in [
+        "path",
+        "file_path",
+        "locator",
+        "url",
+        "resource_id",
+        "job_id",
+        "artifact_id",
+        "browser_session_id",
+        "profile_id",
+        "id",
+    ] {
+        if let Some(value) = object.get(key).and_then(|value| value.as_str()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn build_working_set_entries_from_history(
+    history: &[aria_ssmu::Message],
+    channel: aria_core::GatewayChannel,
+    session_uuid: uuid::Uuid,
+    limit: usize,
+) -> Vec<aria_core::WorkingSetEntry> {
+    let mut entries = Vec::new();
+    for message in history.iter().rev() {
+        let content = message.content.trim();
+        if !content.contains("<TOOL_RESUME_BLOCK>") {
+            continue;
+        }
+        let Some(tool_start) = content.find("Tool '") else {
+            continue;
+        };
+        let after_tool = &content[tool_start + 6..];
+        let Some(tool_end) = after_tool.find('\'') else {
+            continue;
+        };
+        let tool_name = &after_tool[..tool_end];
+        let output = content
+            .split("completed with output:")
+            .nth(1)
+            .unwrap_or("")
+            .replace("</TOOL_RESUME_BLOCK>", "")
+            .trim()
+            .to_string();
+        let lower_output = output.to_ascii_lowercase();
+        if tool_name == "approval"
+            || lower_output.contains("tool execution failed")
+            || lower_output.contains("approval.wasm")
+        {
+            continue;
+        }
+        let preview = output
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        let locator = extract_locator_from_tool_output(&output);
+        entries.push(aria_core::WorkingSetEntry {
+            entry_id: format!("legacy-{}-{}", tool_name, message.timestamp_us),
+            kind: aria_core::WorkingSetEntryKind::Artifact,
+            artifact_kind: execution_artifact_kind_for_tool(tool_name),
+            locator,
+            operation: Some(tool_name.to_string()),
+            origin_tool: Some(tool_name.to_string()),
+            channel: Some(channel),
+            session_id: Some(*session_uuid.as_bytes()),
+            status: aria_core::WorkingSetStatus::Completed,
+            created_at_us: message.timestamp_us,
+            updated_at_us: None,
+            summary: truncate_trace_text(preview, 120),
+            payload: None,
+            approval_id: None,
+        });
+        if entries.len() >= limit {
+            break;
+        }
+    }
+    entries.reverse();
+    entries
+}
+
+fn build_working_set_for_session(
+    store: &RuntimeStore,
+    session_uuid: uuid::Uuid,
+    channel: aria_core::GatewayChannel,
+    history: &[aria_ssmu::Message],
+) -> aria_core::WorkingSet {
+    let session_id = session_uuid.to_string();
+    let mut entries = store
+        .list_working_set_entries(&session_id, 12)
+        .unwrap_or_default();
+    let fallback_entries = build_working_set_entries_from_history(history, channel, session_uuid, 8);
+    if entries.is_empty() {
+        entries = fallback_entries;
+    } else {
+        let mut known_keys = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .locator
+                    .clone()
+                    .unwrap_or_else(|| entry.summary.clone())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        for entry in fallback_entries {
+            let key = entry
+                .locator
+                .clone()
+                .unwrap_or_else(|| entry.summary.clone());
+            if known_keys.insert(key) {
+                entries.push(entry);
+            }
+        }
+        entries.sort_by_key(|entry| entry.created_at_us);
+        if entries.len() > 12 {
+            entries = entries.split_off(entries.len() - 12);
+        }
+    }
+    aria_core::WorkingSet {
+        entries,
+        active_target_entry_id: None,
+        reference_resolution: None,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn build_recent_artifacts_context(history: &[aria_ssmu::Message], limit: usize) -> String {
+    let entries = build_working_set_entries_from_history(
+        history,
+        aria_core::GatewayChannel::Unknown,
+        uuid::Uuid::nil(),
+        limit,
+    );
+    if entries.is_empty() {
+        return String::new();
+    }
+    let lines = entries
+        .iter()
+        .map(|entry| {
+            if let Some(locator) = &entry.locator {
+                format!(
+                    "- tool={} locator={} output={}",
+                    entry.origin_tool.clone().unwrap_or_default(),
+                    locator,
+                    entry.summary
+                )
+            } else {
+                format!(
+                    "- tool={} output={}",
+                    entry.origin_tool.clone().unwrap_or_default(),
+                    entry.summary
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "<recent_artifacts>\n{}\nUse this artifact list to resolve references like \"it\", \"that\", or \"the file\". If multiple artifacts could match, ask a clarification question.\n</recent_artifacts>",
+        lines.join("\n")
+    )
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -12780,6 +13101,22 @@ fn request_is_scheduling_like(request_text: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+fn request_is_cron_management_like(request_text: &str) -> bool {
+    let lower = request_text.to_ascii_lowercase();
+    [
+        "cron",
+        "list jobs",
+        "list crons",
+        "delete cron",
+        "remove cron",
+        "update cron",
+        "manage cron",
+        "scheduler job",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 fn request_is_file_write_like(request_text: &str) -> bool {
     let lower = request_text.to_ascii_lowercase();
     let mentions_file = lower.contains(" file")
@@ -12797,6 +13134,28 @@ fn request_is_file_write_like(request_text: &str) -> bool {
         || lower.contains("update")
         || lower.contains("append");
     mentions_file && write_action
+}
+
+fn request_is_file_modify_like(request_text: &str) -> bool {
+    let lower = request_text.to_ascii_lowercase();
+    let modify_action = lower.contains("modify")
+        || lower.contains("update")
+        || lower.contains("change")
+        || lower.contains("edit")
+        || lower.contains("replace")
+        || lower.contains("rewrite");
+    if !modify_action {
+        return false;
+    }
+    lower.contains(" file")
+        || lower.contains("code")
+        || lower.contains("script")
+        || lower.contains(".js")
+        || lower.contains(".ts")
+        || lower.contains(".py")
+        || lower.contains(".md")
+        || lower.contains(" it ")
+        || lower.ends_with(" it")
 }
 
 fn mcp_tool_alias_name(server_id: &str, tool_name: &str) -> String {
@@ -13396,6 +13755,9 @@ fn infer_execution_artifacts(
                 kind,
                 label: tool_name.clone(),
                 payload: None,
+                locator: None,
+                origin_tool: Some(tool_name.clone()),
+                summary: None,
             })
         })
         .collect::<Vec<_>>();
@@ -13404,9 +13766,82 @@ fn infer_execution_artifacts(
             kind: aria_core::ExecutionArtifactKind::PlainAnswer,
             label: "plain_answer".into(),
             payload: None,
+            locator: None,
+            origin_tool: None,
+            summary: Some(response_text.trim().to_string()),
         });
     }
     artifacts
+}
+
+fn infer_execution_artifacts_from_turns(
+    turns: &[ExecutedToolCall],
+    response_text: &str,
+) -> Vec<aria_core::ExecutionArtifact> {
+    let mut artifacts = turns
+        .iter()
+        .filter_map(|turn| {
+            execution_artifact_kind_for_tool(&turn.call.name).map(|kind| {
+                let payload = turn.result.as_provider_payload();
+                aria_core::ExecutionArtifact {
+                    kind,
+                    label: turn.call.name.clone(),
+                    locator: extract_locator_from_tool_payload(&payload)
+                        .or_else(|| extract_locator_from_tool_output(turn.result.render_for_prompt())),
+                    origin_tool: Some(turn.call.name.clone()),
+                    summary: Some(turn.result.render_for_prompt().trim().to_string()),
+                    payload: Some(payload),
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    if artifacts.is_empty() {
+        artifacts = infer_execution_artifacts(
+            &turns.iter().map(|turn| turn.call.name.clone()).collect::<Vec<_>>(),
+            response_text,
+        );
+    }
+    artifacts
+}
+
+fn working_set_entries_from_artifacts(
+    session_uuid: uuid::Uuid,
+    channel: aria_core::GatewayChannel,
+    artifacts: &[aria_core::ExecutionArtifact],
+) -> Vec<aria_core::WorkingSetEntry> {
+    let now_us = chrono::Utc::now().timestamp_micros() as u64;
+    artifacts
+        .iter()
+        .filter(|artifact| !matches!(artifact.kind, aria_core::ExecutionArtifactKind::PlainAnswer))
+        .map(|artifact| aria_core::WorkingSetEntry {
+            entry_id: uuid::Uuid::new_v4().to_string(),
+            kind: aria_core::WorkingSetEntryKind::Artifact,
+            artifact_kind: Some(artifact.kind),
+            locator: artifact.locator.clone(),
+            operation: artifact.origin_tool.clone().or_else(|| Some(artifact.label.clone())),
+            origin_tool: artifact.origin_tool.clone(),
+            channel: Some(channel),
+            session_id: Some(*session_uuid.as_bytes()),
+            status: aria_core::WorkingSetStatus::Completed,
+            created_at_us: now_us,
+            updated_at_us: None,
+            summary: artifact
+                .summary
+                .clone()
+                .unwrap_or_else(|| artifact.label.clone()),
+            payload: artifact.payload.clone(),
+            approval_id: None,
+        })
+        .collect()
+}
+
+fn persist_working_set_entries(
+    store: &RuntimeStore,
+    entries: &[aria_core::WorkingSetEntry],
+) {
+    for entry in entries {
+        let _ = store.append_working_set_entry(entry);
+    }
 }
 
 fn validate_execution_contract(
@@ -13432,13 +13867,58 @@ fn execution_contract_requires_tool_capable_model(
     !contract.required_artifact_kinds.is_empty()
 }
 
+fn required_runtime_tool_names_for_contract(
+    contract: &aria_core::ExecutionContract,
+) -> &'static [&'static str] {
+    match contract.kind {
+        aria_core::ExecutionContractKind::ScheduleCreate => {
+            &["schedule_message", "set_reminder", "manage_cron"]
+        }
+        aria_core::ExecutionContractKind::ArtifactCreate => &["write_file"],
+        aria_core::ExecutionContractKind::BrowserRead => {
+            &["browser_open", "browser_snapshot", "browser_screenshot", "browser_extract"]
+        }
+        aria_core::ExecutionContractKind::BrowserAct => &["browser_act"],
+        aria_core::ExecutionContractKind::McpInvoke => {
+            &["invoke_mcp_tool", "render_mcp_prompt", "read_mcp_resource"]
+        }
+        aria_core::ExecutionContractKind::SubAgentSpawn => &["spawn_agent"],
+        _ => &[],
+    }
+}
+
 fn effective_tool_runtime_policy_for_request(
     req: &AgentRequest,
     request_text: &str,
     scheduling_intent: Option<&SchedulingIntent>,
+    execution_contract: &aria_core::ExecutionContract,
 ) -> Option<aria_core::ToolRuntimePolicy> {
     if let Some(policy) = req.tool_runtime_policy.clone() {
         return Some(policy);
+    }
+    if matches!(
+        execution_contract.kind,
+        aria_core::ExecutionContractKind::ArtifactCreate
+    ) {
+        return Some(aria_core::ToolRuntimePolicy {
+            tool_choice: aria_core::ToolChoicePolicy::Specific("write_file".to_string()),
+            allow_parallel_tool_calls: false,
+        });
+    }
+    if matches!(
+        execution_contract.kind,
+        aria_core::ExecutionContractKind::ScheduleCreate
+    ) {
+        return Some(aria_core::ToolRuntimePolicy {
+            tool_choice: aria_core::ToolChoicePolicy::Specific("schedule_message".to_string()),
+            allow_parallel_tool_calls: false,
+        });
+    }
+    if request_is_file_modify_like(request_text) {
+        return Some(aria_core::ToolRuntimePolicy {
+            tool_choice: aria_core::ToolChoicePolicy::Specific("write_file".to_string()),
+            allow_parallel_tool_calls: false,
+        });
     }
     if request_is_browser_action_like(request_text) {
         return Some(aria_core::ToolRuntimePolicy {
@@ -13472,6 +13952,26 @@ fn resolve_workspace_lock_key(agent: &str, whitelist: &[String]) -> String {
     } else {
         format!("workspace:{}", roots.join("|"))
     }
+}
+
+fn tool_requires_workspace_lock(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "write_file"
+            | "edit_file"
+            | "execute_file"
+            | "run_shell"
+            | "spawn_agent"
+            | "browser_fill"
+            | "browser_click"
+            | "browser_login_begin_manual"
+            | "browser_login_complete_manual"
+            | "browser_login_fill_credentials"
+            | "install_skill_package"
+            | "activate_skill_binding"
+            | "register_mcp_server"
+            | "manage_browser_profile"
+    )
 }
 
 async fn process_request(
@@ -13608,8 +14108,12 @@ async fn process_request(
         }
     };
 
-    let effective_tool_runtime_policy =
-        effective_tool_runtime_policy_for_request(req, &request_text, scheduling_intent.as_ref());
+    let effective_tool_runtime_policy = effective_tool_runtime_policy_for_request(
+        req,
+        &request_text,
+        scheduling_intent.as_ref(),
+        &execution_contract,
+    );
     let effective_req = if effective_tool_runtime_policy != req.tool_runtime_policy {
         let mut adjusted = req.clone();
         adjusted.tool_runtime_policy = effective_tool_runtime_policy;
@@ -13805,10 +14309,15 @@ async fn process_request(
     }
 
     let executed_tool_names = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let executed_tool_turns = Arc::new(std::sync::Mutex::new(Vec::<ExecutedToolCall>::new()));
     let llm_backend = PoolBackedLLM::new(llm_pool.clone(), override_backend);
     let orchestrator = AgentOrchestrator::new(
         llm_backend.clone(),
-        RecordingToolExecutor::new(policy_executor, Arc::clone(&executed_tool_names)),
+        RecordingToolExecutor::new(
+            policy_executor,
+            Arc::clone(&executed_tool_names),
+            Arc::clone(&executed_tool_turns),
+        ),
     )
     .with_repair_fallback(allow_repair_fallback)
         .with_event_sink(Arc::new(RepairFallbackAuditSink {
@@ -13910,6 +14419,23 @@ async fn process_request(
             CachedTool {
                 name: tool_name.to_string(),
                 description: format!("Runtime tool '{}'", tool_name),
+                parameters_schema: "{}".into(),
+                embedding: Vec::new(),
+                requires_strict_schema: false,
+                streaming_safe: false,
+                parallel_safe: true,
+                modalities: vec![aria_core::ToolModality::Text],
+            }
+        };
+        let _ = cache.insert(tool);
+    }
+    for tool_name in required_runtime_tool_names_for_contract(&execution_contract) {
+        let tool = if let Some(tool) = tool_registry.get_by_name(tool_name) {
+            tool
+        } else {
+            CachedTool {
+                name: tool_name.to_string(),
+                description: format!("Contract-required tool '{}'", tool_name),
                 parameters_schema: "{}".into(),
                 embedding: Vec::new(),
                 requires_strict_schema: false,
@@ -14083,6 +14609,12 @@ async fn process_request(
         rag_context_len = rag_context.len(),
         "process_request: RAG context built"
     );
+    let working_set = build_working_set_for_session(
+        &store,
+        session_uuid,
+        effective_req.channel,
+        &session_history,
+    );
 
     let user_msg = aria_ssmu::Message {
         role: "user".into(),
@@ -14139,24 +14671,23 @@ async fn process_request(
         &cache.active_tools(),
         tool_registry,
         embedder,
+        Some(&working_set),
         active_model_capability.as_ref(),
         effective_req.tool_runtime_policy.as_ref(),
         allow_repair_fallback,
         prompt_budget,
     );
-    if scheduling_intent.is_some() {
-        for required_name in ["set_reminder", "schedule_message"] {
-            if prompt_tools.iter().any(|tool| tool.name == required_name) {
-                continue;
-            }
-            if let Some(tool) = cache
-                .active_tools()
-                .iter()
-                .find(|tool| tool.name == required_name)
-                .cloned()
-            {
-                prompt_tools.push(tool);
-            }
+    for required_name in required_runtime_tool_names_for_contract(&execution_contract) {
+        if prompt_tools.iter().any(|tool| tool.name == *required_name) {
+            continue;
+        }
+        if let Some(tool) = cache
+            .active_tools()
+            .iter()
+            .find(|tool| tool.name == *required_name)
+            .cloned()
+        {
+            prompt_tools.push(tool);
         }
     }
     let learning_rollout_ctx = build_learning_rollout_prompt_context(&promoted_learning_candidates);
@@ -14301,15 +14832,18 @@ async fn process_request(
             content,
         });
     }
-    let inspection_pack = aria_core::ExecutionContextPack {
-        system_prompt: final_system_prompt.clone(),
-        history_messages: prompt_history_messages.clone(),
-        context_blocks: context_blocks.clone(),
-        user_request: request_text.clone(),
-        channel: effective_req.channel,
-        execution_contract: Some(execution_contract.clone()),
-        retrieved_context: Some(retrieved_context_bundle.clone()),
-    };
+    let inspection_pack = aria_intelligence::ContextPlanner::plan(
+        aria_intelligence::ContextPlannerInput {
+            system_prompt: final_system_prompt.clone(),
+            history_messages: prompt_history_messages.clone(),
+            candidate_blocks: context_blocks.clone(),
+            user_request: request_text.clone(),
+            channel: effective_req.channel,
+            execution_contract: Some(execution_contract.clone()),
+            retrieved_context: Some(retrieved_context_bundle.clone()),
+            working_set: Some(working_set.clone()),
+        },
+    );
     let default_tool_runtime_policy = aria_core::ToolRuntimePolicy::default();
     let provider_request_payload = llm_backend.inspect_context_payload(
         &inspection_pack,
@@ -14346,7 +14880,8 @@ async fn process_request(
             .map(|profile| profile.model_ref.as_slash_ref()),
         prompt_mode: "execution".into(),
         history_tokens: estimate_token_count(&history_ctx) as u32,
-        context_tokens: context_blocks
+        context_tokens: inspection_pack
+            .context_blocks
             .iter()
             .map(|block| block.token_estimate)
             .sum(),
@@ -14366,23 +14901,6 @@ async fn process_request(
         created_at_us: effective_req.timestamp_us,
     };
 
-    let workspace_key = resolve_workspace_lock_key(&agent, &whitelist);
-    let _workspace_guard = workspace_lock_manager()
-        .acquire(
-            workspace_key.clone(),
-            format!("session:{}:agent:{}", session_uuid, agent),
-        )
-        .await
-        .map_err(|err| {
-            warn!(
-                session_id = %session_uuid,
-                workspace_key = %workspace_key,
-                error = %err,
-                "workspace coordination rejected request"
-            );
-            err
-        })?;
-
     let allow_contract_retry = !execution_contract.required_artifact_kinds.is_empty();
     let mut orchestrator_result = orchestrator
         .run_for_request_with_dynamic_tools(aria_intelligence::DynamicRunContext {
@@ -14390,6 +14908,7 @@ async fn process_request(
             request: &effective_req,
             history_context: &history_ctx,
             rag_context: &rag_context,
+            initial_context_pack: Some(inspection_pack.clone()),
             history_messages: &prompt_history_messages,
             context_blocks: &context_blocks,
             prompt_tools: Some(&prompt_tools),
@@ -14407,6 +14926,10 @@ async fn process_request(
     let mut executed_tools_snapshot = executed_tool_names
         .lock()
         .expect("executed tool names lock poisoned")
+        .clone();
+    let mut executed_tool_turns_snapshot = executed_tool_turns
+        .lock()
+        .expect("executed tool turns lock poisoned")
         .clone();
     if allow_contract_retry
         && executed_tools_snapshot.is_empty()
@@ -14431,6 +14954,7 @@ async fn process_request(
                 request: &retry_req,
                 history_context: &history_ctx,
                 rag_context: &rag_context,
+                initial_context_pack: Some(inspection_pack.clone()),
                 history_messages: &prompt_history_messages,
                 context_blocks: &context_blocks,
                 prompt_tools: Some(&prompt_tools),
@@ -14448,6 +14972,10 @@ async fn process_request(
             .lock()
             .expect("executed tool names lock poisoned")
             .clone();
+        let retry_turns_snapshot = executed_tool_turns
+            .lock()
+            .expect("executed tool turns lock poisoned")
+            .clone();
         if retry_tools_snapshot.len() > executed_tools_snapshot.len()
             || matches!(
                 retry_result,
@@ -14456,6 +14984,7 @@ async fn process_request(
         {
             orchestrator_result = retry_result;
             executed_tools_snapshot = retry_tools_snapshot;
+            executed_tool_turns_snapshot = retry_turns_snapshot;
         }
     }
 
@@ -14472,6 +15001,10 @@ async fn process_request(
                     match build_policy_executor().execute(&repaired_call).await {
                     Ok(tool_result) => {
                         executed_tools_snapshot.push(repaired_call.name.clone());
+                        executed_tool_turns_snapshot.push(ExecutedToolCall {
+                            call: repaired_call.clone(),
+                            result: tool_result.clone(),
+                        });
                         orchestrator_result = aria_intelligence::OrchestratorResult::Completed(
                             tool_result.render_for_prompt().to_string(),
                         );
@@ -14512,9 +15045,22 @@ async fn process_request(
     }
 
     if let aria_intelligence::OrchestratorResult::Completed(response_text) = &orchestrator_result {
-        let execution_artifacts = infer_execution_artifacts(&executed_tools_snapshot, response_text);
+        let execution_artifacts =
+            infer_execution_artifacts_from_turns(&executed_tool_turns_snapshot, response_text);
+        let working_set_entries = working_set_entries_from_artifacts(
+            session_uuid,
+            effective_req.channel,
+            &execution_artifacts,
+        );
+        persist_working_set_entries(&store, &working_set_entries);
         let mut context_inspection = base_context_inspection.clone();
         context_inspection.emitted_artifacts = execution_artifacts.clone();
+        context_inspection.pack = aria_intelligence::append_tool_results_to_context_pack(
+            &context_inspection.pack,
+            &executed_tool_turns_snapshot,
+        );
+        context_inspection.rendered_prompt =
+            aria_intelligence::PromptManager::render_execution_context_pack(&context_inspection.pack);
         let _ = RuntimeStore::for_sessions_dir(&sessions_dir)
             .append_context_inspection(&context_inspection);
         if let Err(reason) = validate_execution_contract(&execution_contract, &execution_artifacts) {
@@ -14809,6 +15355,7 @@ mod phase8_tests {
             &active_tools,
             &registry,
             &embedder,
+            None,
             Some(&model_capability),
             None,
             false,
@@ -14860,6 +15407,7 @@ mod phase8_tests {
             &active_tools,
             &registry,
             &embedder,
+            None,
             Some(&model_capability),
             None,
             true,
@@ -14907,6 +15455,7 @@ mod phase8_tests {
             &embedder,
             None,
             None,
+            None,
             true,
             PromptBudget {
                 tool_count: 2,
@@ -14945,6 +15494,7 @@ mod phase8_tests {
             &registry,
             &embedder,
             None,
+            None,
             Some(&policy),
             true,
             PromptBudget {
@@ -14958,5 +15508,113 @@ mod phase8_tests {
             decision.selected_tool_names,
             vec![String::from("browser_session_start")]
         );
+    }
+
+    #[test]
+    fn required_runtime_tool_names_follow_execution_contract_kind() {
+        let schedule_contract = aria_core::ExecutionContract {
+            kind: aria_core::ExecutionContractKind::ScheduleCreate,
+            allowed_tool_classes: vec![],
+            required_artifact_kinds: vec![aria_core::ExecutionArtifactKind::Schedule],
+            forbidden_completion_modes: vec![],
+            fallback_mode: None,
+            approval_required: false,
+        };
+        assert_eq!(
+            required_runtime_tool_names_for_contract(&schedule_contract),
+            ["schedule_message", "set_reminder", "manage_cron"]
+        );
+
+        let file_contract = aria_core::ExecutionContract {
+            kind: aria_core::ExecutionContractKind::ArtifactCreate,
+            allowed_tool_classes: vec![],
+            required_artifact_kinds: vec![aria_core::ExecutionArtifactKind::File],
+            forbidden_completion_modes: vec![],
+            fallback_mode: None,
+            approval_required: true,
+        };
+        assert_eq!(
+            required_runtime_tool_names_for_contract(&file_contract),
+            ["write_file"]
+        );
+    }
+
+    #[test]
+    fn effective_tool_runtime_policy_defaults_to_contract_specific_tool_choice() {
+        let req = aria_core::AgentRequest {
+            request_id: *uuid::Uuid::new_v4().as_bytes(),
+            session_id: *uuid::Uuid::new_v4().as_bytes(),
+            channel: aria_core::GatewayChannel::Cli,
+            user_id: "test-user".into(),
+            content: aria_core::MessageContent::Text("create a js file".into()),
+            tool_runtime_policy: None,
+            timestamp_us: 0,
+        };
+
+        let file_contract = aria_core::ExecutionContract {
+            kind: aria_core::ExecutionContractKind::ArtifactCreate,
+            allowed_tool_classes: vec![],
+            required_artifact_kinds: vec![aria_core::ExecutionArtifactKind::File],
+            forbidden_completion_modes: vec![],
+            fallback_mode: None,
+            approval_required: true,
+        };
+        let schedule_contract = aria_core::ExecutionContract {
+            kind: aria_core::ExecutionContractKind::ScheduleCreate,
+            allowed_tool_classes: vec![],
+            required_artifact_kinds: vec![aria_core::ExecutionArtifactKind::Schedule],
+            forbidden_completion_modes: vec![],
+            fallback_mode: None,
+            approval_required: false,
+        };
+
+        let file_policy =
+            effective_tool_runtime_policy_for_request(&req, "create file", None, &file_contract)
+                .expect("file contract policy");
+        assert_eq!(
+            file_policy.tool_choice,
+            aria_core::ToolChoicePolicy::Specific("write_file".into())
+        );
+
+        let schedule_policy = effective_tool_runtime_policy_for_request(
+            &req,
+            "remind me in 2 mins",
+            None,
+            &schedule_contract,
+        )
+        .expect("schedule contract policy");
+        assert_eq!(
+            schedule_policy.tool_choice,
+            aria_core::ToolChoicePolicy::Specific("schedule_message".into())
+        );
+    }
+
+    #[test]
+    fn request_is_file_modify_like_detects_followup_edit_language() {
+        assert!(request_is_file_modify_like(
+            "Modify it to print hello batman instead"
+        ));
+        assert!(request_is_file_modify_like("Update the file content to hello"));
+        assert!(!request_is_file_modify_like("How are you today?"));
+    }
+
+    #[test]
+    fn build_recent_artifacts_context_includes_latest_write_artifacts() {
+        let history = vec![
+            aria_ssmu::Message {
+                role: "user".into(),
+                content: "<TOOL_RESUME_BLOCK>\nTool 'write_file' completed with output:\nSuccessfully wrote 28 bytes to hello_joker.js</TOOL_RESUME_BLOCK>".into(),
+                timestamp_us: 1,
+            },
+            aria_ssmu::Message {
+                role: "user".into(),
+                content: "<TOOL_RESUME_BLOCK>\nTool 'write_file' completed with output:\nSuccessfully wrote 29 bytes to hello.js</TOOL_RESUME_BLOCK>".into(),
+                timestamp_us: 2,
+            },
+        ];
+        let ctx = build_recent_artifacts_context(&history, 4);
+        assert!(ctx.contains("hello_joker.js"));
+        assert!(ctx.contains("hello.js"));
+        assert!(ctx.contains("recent_artifacts"));
     }
 }

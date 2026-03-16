@@ -52,9 +52,10 @@ use aria_intelligence::{
         self, ollama::OllamaBackend, resolve_capability_profile, ProviderRegistry, SecretRef,
     },
     AgentConfigStore, AgentOrchestrator, CachedTool, DynamicToolCache, EmbeddingModel,
-    FastEmbedder, LLMBackend, LLMResponse, LlmBackendPool, OrchestratorError, OrchestratorEvent,
-    OrchestratorEventSink, PromptManager, RouteConfig, RouterIndex, ScheduleSpec, ScheduledJobKind,
-    ScheduledPromptJob, SemanticRouter, ToolCall, ToolExecutionResult, ToolExecutor,
+    ExecutedToolCall, FastEmbedder, LLMBackend, LLMResponse, LlmBackendPool, OrchestratorError,
+    OrchestratorEvent, OrchestratorEventSink, PromptManager, RouteConfig, RouterIndex,
+    ScheduleSpec, ScheduledJobKind, ScheduledPromptJob, SemanticRouter, ToolCall,
+    ToolExecutionResult, ToolExecutor,
     ToolManifestStore,
 };
 use aria_learning::{

@@ -111,6 +111,9 @@ pub enum ContextBlockKind {
     DurableConstraint,
     SubAgentResult,
     ToolInstructions,
+    ToolResult,
+    WorkingSet,
+    Ambiguity,
     PromptAsset,
     ResourceContext,
     CapabilityIndex,
@@ -144,6 +147,10 @@ pub struct ExecutionContextPack {
     pub execution_contract: Option<ExecutionContract>,
     #[serde(default)]
     pub retrieved_context: Option<RetrievedContextBundle>,
+    #[serde(default)]
+    pub working_set: Option<WorkingSet>,
+    #[serde(default)]
+    pub context_plan: Option<ContextPlan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +199,122 @@ pub struct ExecutionArtifact {
     pub label: String,
     #[serde(default)]
     pub payload: Option<serde_json::Value>,
+    #[serde(default)]
+    pub locator: Option<String>,
+    #[serde(default)]
+    pub origin_tool: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingSetEntryKind {
+    Artifact,
+    Resource,
+    PendingApproval,
+    ToolOutput,
+    WorkspaceTarget,
+    ExternalReference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingSetStatus {
+    Pending,
+    Active,
+    Completed,
+    Failed,
+    Superseded,
+    Resolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkingSetEntry {
+    pub entry_id: String,
+    pub kind: WorkingSetEntryKind,
+    #[serde(default)]
+    pub artifact_kind: Option<ExecutionArtifactKind>,
+    #[serde(default)]
+    pub locator: Option<String>,
+    #[serde(default)]
+    pub operation: Option<String>,
+    #[serde(default)]
+    pub origin_tool: Option<String>,
+    #[serde(default)]
+    pub channel: Option<GatewayChannel>,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    pub status: WorkingSetStatus,
+    pub created_at_us: u64,
+    #[serde(default)]
+    pub updated_at_us: Option<u64>,
+    pub summary: String,
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    #[serde(default)]
+    pub approval_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceResolutionOutcome {
+    Resolved,
+    Ambiguous,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceResolution {
+    pub query_text: String,
+    pub outcome: ReferenceResolutionOutcome,
+    #[serde(default)]
+    pub matched_entry_ids: Vec<String>,
+    #[serde(default)]
+    pub active_target_entry_id: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct WorkingSet {
+    #[serde(default)]
+    pub entries: Vec<WorkingSetEntry>,
+    #[serde(default)]
+    pub active_target_entry_id: Option<String>,
+    #[serde(default)]
+    pub reference_resolution: Option<ReferenceResolution>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextPlanDecision {
+    Included,
+    DroppedEmpty,
+    DroppedDuplicate,
+    DroppedBudget,
+    DroppedPolicy,
+    DroppedAmbiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectionBlockRecord {
+    pub kind: ContextBlockKind,
+    pub label: String,
+    pub decision: ContextPlanDecision,
+    pub token_estimate: u32,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ContextPlan {
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub block_records: Vec<InspectionBlockRecord>,
+    #[serde(default)]
+    pub ambiguity: Option<ReferenceResolution>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

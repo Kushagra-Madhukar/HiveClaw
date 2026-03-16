@@ -125,7 +125,7 @@ impl PromptManager {
             5. Current local time: {}.\n\
             6. For reminders/scheduling, always pass a structured 'schedule' object. Use kind='at' with RFC3339 timestamps for one-shot events, kind='every' for fixed intervals, kind='daily' for daily wall-clock time, kind='weekly' for weekly or biweekly wall-clock time, and kind='cron' for advanced cron expressions.\n\
             7. For schedule_message/set_reminder, use mode='notify' for static reminders, mode='defer' to execute work at trigger time, and mode='both' if both are needed.\n\
-            8. If user asks to perform work \"in X\" time, default to mode='defer' (do not execute now) unless user explicitly asks for both immediate and delayed output.\n\
+            8. If user asks to perform work or generate output later, default to mode='defer'. If the user is asking to be reminded, informed, told, pinged, or notified later, default to mode='notify' unless they explicitly asked for deferred execution.\n\
             9. Prefer schedule.kind='at' for one-shot requests like \"in 1 minute\", \"after 2 hours\", \"today at 10 PM\", or \"tomorrow 8:15 AM\". Use schedule.kind='every' only for true repeating intervals. Use schedule.kind='daily' or 'weekly' only when the user asks for recurring wall-clock schedules.\n\
             10. Never emit placeholder schedule payloads like \"{{}}\", \"null\", or empty objects. Always send a concrete schedule object with a kind.\n\
             11. {}\n",
@@ -152,6 +152,8 @@ impl PromptManager {
             channel: request.channel,
             execution_contract: None,
             retrieved_context: None,
+            working_set: None,
+            context_plan: None,
         }
     }
 
@@ -184,6 +186,45 @@ impl PromptManager {
                 rendered.push_str(&format!(
                     "- {:?} {} score={:?}\n",
                     block.source_kind, block.label, block.score
+                ));
+            }
+        }
+        if let Some(working_set) = &pack.working_set {
+            rendered.push_str("\n\nWorking Set:\n");
+            if let Some(resolution) = &working_set.reference_resolution {
+                rendered.push_str(&format!(
+                    "reference_resolution={:?}; active_target={:?}; matched={:?}\n",
+                    resolution.outcome,
+                    resolution.active_target_entry_id,
+                    resolution.matched_entry_ids
+                ));
+            }
+            for entry in &working_set.entries {
+                rendered.push_str(&format!(
+                    "- {:?} {:?} locator={:?} tool={:?} status={:?}: {}\n",
+                    entry.kind,
+                    entry.artifact_kind,
+                    entry.locator,
+                    entry.origin_tool,
+                    entry.status,
+                    entry.summary
+                ));
+            }
+        }
+        if let Some(context_plan) = &pack.context_plan {
+            rendered.push_str("\n\nContext Plan:\n");
+            if let Some(summary) = &context_plan.summary {
+                rendered.push_str(summary);
+                rendered.push('\n');
+            }
+            for record in &context_plan.block_records {
+                rendered.push_str(&format!(
+                    "- {:?} [{}] {:?} tokens={} reason={:?}\n",
+                    record.kind,
+                    record.label,
+                    record.decision,
+                    record.token_estimate,
+                    record.reason
                 ));
             }
         }
@@ -253,6 +294,9 @@ impl PromptManager {
             ContextBlockKind::ToolInstructions => {
                 format!("Tool Instructions [{}]:", block.label)
             }
+            ContextBlockKind::ToolResult => format!("Tool Results [{}]:", block.label),
+            ContextBlockKind::WorkingSet => format!("Working Set [{}]:", block.label),
+            ContextBlockKind::Ambiguity => format!("Ambiguity [{}]:", block.label),
             ContextBlockKind::PromptAsset => format!("Prompt Assets [{}]:", block.label),
             ContextBlockKind::ResourceContext => format!("Resource Context [{}]:", block.label),
             ContextBlockKind::CapabilityIndex => format!("Capability Index [{}]:", block.label),

@@ -258,6 +258,8 @@ mod browser;
 mod connection;
 #[path = "runtime_store/control.rs"]
 mod control;
+#[path = "runtime_store/working_set.rs"]
+mod working_set;
 #[path = "runtime_store/crawl.rs"]
 mod crawl;
 #[path = "runtime_store/helpers.rs"]

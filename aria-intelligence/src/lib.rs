@@ -38,6 +38,8 @@ pub use backends::{
 };
 
 mod hardware;
+mod context_planner;
+mod middleware;
 mod orchestrator;
 mod prompting;
 mod router;
@@ -49,11 +51,13 @@ mod tests;
 mod tools;
 
 pub(crate) use hardware::render_tool_result_for_model;
+pub use context_planner::*;
 pub use hardware::*;
+pub use middleware::*;
 #[cfg(test)]
 pub(crate) use orchestrator::maybe_finalize_after_scheduler_tools;
 pub use orchestrator::*;
-pub(crate) use orchestrator::{append_tool_results_to_context_pack, append_tool_results_to_prompt};
+pub use orchestrator::{append_tool_results_to_context_pack, append_tool_results_to_prompt};
 pub use prompting::*;
 pub use router::*;
 #[cfg(test)]

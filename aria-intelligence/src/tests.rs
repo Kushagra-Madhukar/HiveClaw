@@ -1926,6 +1926,8 @@ trust_profile = "untrusted_web"
             channel: aria_core::GatewayChannel::Cli,
             execution_contract: None,
             retrieved_context: None,
+            working_set: None,
+            context_plan: None,
         };
         let messages = crate::backends::build_openai_compatible_initial_messages(&pack);
         assert_eq!(messages[0]["role"], serde_json::json!("system"));
@@ -1959,6 +1961,8 @@ trust_profile = "untrusted_web"
             channel: aria_core::GatewayChannel::Cli,
             execution_contract: None,
             retrieved_context: None,
+            working_set: None,
+            context_plan: None,
         };
         let messages = crate::backends::build_anthropic_initial_messages(&pack);
         assert_eq!(messages[0]["role"], serde_json::json!("assistant"));
@@ -1991,6 +1995,8 @@ trust_profile = "untrusted_web"
             channel: aria_core::GatewayChannel::Cli,
             execution_contract: None,
             retrieved_context: None,
+            working_set: None,
+            context_plan: None,
         };
         let (system, contents) = crate::backends::build_gemini_initial_contents(&pack);
         assert_eq!(
@@ -2027,6 +2033,8 @@ trust_profile = "untrusted_web"
             channel: aria_core::GatewayChannel::Cli,
             execution_contract: None,
             retrieved_context: None,
+            working_set: None,
+            context_plan: None,
         };
         let backend =
             crate::backends::ollama::OllamaBackend::new("http://127.0.0.1:11434", "llama3");
@@ -2422,6 +2430,7 @@ trust_profile = "untrusted_web"
                 request: &request,
                 history_context: "history",
                 rag_context: "rag",
+                initial_context_pack: None,
                 history_messages: &[],
                 context_blocks: &[],
                 prompt_tools: None,
@@ -2523,6 +2532,7 @@ trust_profile = "untrusted_web"
                 request: &request,
                 history_context: "",
                 rag_context: "",
+                initial_context_pack: None,
                 history_messages: &[],
                 context_blocks: &[],
                 prompt_tools: None,
@@ -2663,6 +2673,7 @@ trust_profile = "untrusted_web"
                 request: &request,
                 history_context: "",
                 rag_context: "",
+                initial_context_pack: None,
                 history_messages: &[],
                 context_blocks: &[],
                 prompt_tools: None,
@@ -3243,6 +3254,8 @@ trust_profile = "untrusted_web"
             channel: aria_core::GatewayChannel::Cli,
             execution_contract: None,
             retrieved_context: None,
+            working_set: None,
+            context_plan: None,
         };
         let mut uses_prompt_override = false;
         let mut last_progress = Instant::now();
@@ -4111,5 +4124,119 @@ trust_profile = "untrusted_web"
             audits[0].outcome,
             crate::backends::EgressSecretOutcome::Denied
         );
+    }
+
+    #[test]
+    fn context_planner_resolves_single_working_set_candidate() {
+        let pack = crate::ContextPlanner::plan(crate::ContextPlannerInput {
+            system_prompt: "sys".into(),
+            history_messages: Vec::new(),
+            candidate_blocks: vec![aria_core::ContextBlock {
+                kind: aria_core::ContextBlockKind::Retrieval,
+                label: "retrieval".into(),
+                content: "evidence".into(),
+                token_estimate: 1,
+            }],
+            user_request: "modify it to print hello batman".into(),
+            channel: aria_core::GatewayChannel::Cli,
+            execution_contract: None,
+            retrieved_context: None,
+            working_set: Some(aria_core::WorkingSet {
+                entries: vec![aria_core::WorkingSetEntry {
+                    entry_id: "file-1".into(),
+                    kind: aria_core::WorkingSetEntryKind::Artifact,
+                    artifact_kind: Some(aria_core::ExecutionArtifactKind::File),
+                    locator: Some("hello.js".into()),
+                    operation: Some("write_file".into()),
+                    origin_tool: Some("write_file".into()),
+                    channel: Some(aria_core::GatewayChannel::Cli),
+                    session_id: None,
+                    status: aria_core::WorkingSetStatus::Completed,
+                    created_at_us: 2,
+                    updated_at_us: None,
+                    summary: "created hello.js".into(),
+                    payload: None,
+                    approval_id: None,
+                }],
+                active_target_entry_id: None,
+                reference_resolution: None,
+            }),
+        });
+        let working_set = pack.working_set.expect("working set");
+        let resolution = working_set
+            .reference_resolution
+            .expect("reference resolution");
+        assert_eq!(
+            resolution.outcome,
+            aria_core::ReferenceResolutionOutcome::Resolved
+        );
+        assert_eq!(working_set.active_target_entry_id.as_deref(), Some("file-1"));
+        assert!(pack
+            .context_blocks
+            .iter()
+            .any(|block| matches!(block.kind, aria_core::ContextBlockKind::WorkingSet)));
+    }
+
+    #[test]
+    fn context_planner_emits_ambiguity_block_for_competing_candidates() {
+        let pack = crate::ContextPlanner::plan(crate::ContextPlannerInput {
+            system_prompt: "sys".into(),
+            history_messages: Vec::new(),
+            candidate_blocks: Vec::new(),
+            user_request: "change it".into(),
+            channel: aria_core::GatewayChannel::Cli,
+            execution_contract: None,
+            retrieved_context: None,
+            working_set: Some(aria_core::WorkingSet {
+                entries: vec![
+                    aria_core::WorkingSetEntry {
+                        entry_id: "file-a".into(),
+                        kind: aria_core::WorkingSetEntryKind::Artifact,
+                        artifact_kind: Some(aria_core::ExecutionArtifactKind::File),
+                        locator: Some("hello.js".into()),
+                        operation: Some("write_file".into()),
+                        origin_tool: Some("write_file".into()),
+                        channel: Some(aria_core::GatewayChannel::Cli),
+                        session_id: None,
+                        status: aria_core::WorkingSetStatus::Completed,
+                        created_at_us: 2,
+                        updated_at_us: None,
+                        summary: "created hello.js".into(),
+                        payload: None,
+                        approval_id: None,
+                    },
+                    aria_core::WorkingSetEntry {
+                        entry_id: "file-b".into(),
+                        kind: aria_core::WorkingSetEntryKind::Artifact,
+                        artifact_kind: Some(aria_core::ExecutionArtifactKind::File),
+                        locator: Some("hello_joker.js".into()),
+                        operation: Some("write_file".into()),
+                        origin_tool: Some("write_file".into()),
+                        channel: Some(aria_core::GatewayChannel::Cli),
+                        session_id: None,
+                        status: aria_core::WorkingSetStatus::Completed,
+                        created_at_us: 3,
+                        updated_at_us: None,
+                        summary: "created hello_joker.js".into(),
+                        payload: None,
+                        approval_id: None,
+                    },
+                ],
+                active_target_entry_id: None,
+                reference_resolution: None,
+            }),
+        });
+        let resolution = pack
+            .working_set
+            .and_then(|working_set| working_set.reference_resolution)
+            .expect("reference resolution");
+        assert_eq!(
+            resolution.outcome,
+            aria_core::ReferenceResolutionOutcome::Ambiguous
+        );
+        assert!(pack
+            .context_blocks
+            .iter()
+            .any(|block| matches!(block.kind, aria_core::ContextBlockKind::Ambiguity)));
     }
 }

@@ -61,6 +61,7 @@ pub struct AgentOrchestrator<L: LLMBackend, T: ToolExecutor> {
     tool_runtime_policy: ToolRuntimePolicy,
     allow_repair_fallback: bool,
     event_sink: Option<Arc<dyn OrchestratorEventSink>>,
+    middlewares: Vec<Arc<dyn ToolLoopMiddleware>>,
 }
 
 /// Commands injected by the human operator mid-flight to alter agent reasoning
@@ -104,6 +105,7 @@ pub struct DynamicRunContext<'a, E: EmbeddingModel> {
     pub request: &'a AgentRequest,
     pub history_context: &'a str,
     pub rag_context: &'a str,
+    pub initial_context_pack: Option<aria_core::ExecutionContextPack>,
     pub history_messages: &'a [aria_core::PromptContextMessage],
     pub context_blocks: &'a [aria_core::ContextBlock],
     pub prompt_tools: Option<&'a [CachedTool]>,
@@ -161,6 +163,7 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
             tool_runtime_policy: ToolRuntimePolicy::default(),
             allow_repair_fallback: false,
             event_sink: None,
+            middlewares: vec![Arc::new(StateTrackingMiddleware)],
         }
     }
 
@@ -176,6 +179,11 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
 
     pub fn with_event_sink(mut self, event_sink: Arc<dyn OrchestratorEventSink>) -> Self {
         self.event_sink = Some(event_sink);
+        self
+    }
+
+    pub fn with_tool_loop_middleware(mut self, middleware: Arc<dyn ToolLoopMiddleware>) -> Self {
+        self.middlewares.push(middleware);
         self
     }
 
@@ -206,6 +214,42 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
         if let Some(sink) = &self.event_sink {
             sink.on_event(&event);
         }
+    }
+
+    fn run_before_tool_middlewares(
+        &self,
+        context_pack: &mut ExecutionContextPack,
+        available_tools: &[CachedTool],
+        tool_runtime_policy: &ToolRuntimePolicy,
+        call: &ToolCall,
+    ) -> Result<(), OrchestratorError> {
+        let mut ctx = ToolLoopMiddlewareContext {
+            context_pack,
+            available_tools,
+            tool_runtime_policy,
+        };
+        for middleware in &self.middlewares {
+            middleware.before_tool_call(&mut ctx, call)?;
+        }
+        Ok(())
+    }
+
+    fn run_after_tool_middlewares(
+        &self,
+        context_pack: &mut ExecutionContextPack,
+        available_tools: &[CachedTool],
+        tool_runtime_policy: &ToolRuntimePolicy,
+        executed: &ExecutedToolCall,
+    ) -> Result<(), OrchestratorError> {
+        let mut ctx = ToolLoopMiddlewareContext {
+            context_pack,
+            available_tools,
+            tool_runtime_policy,
+        };
+        for middleware in &self.middlewares {
+            middleware.after_tool_call(&mut ctx, executed)?;
+        }
+        Ok(())
     }
 
     fn repaired_tool_call_from_text(&self, answer: &str, tools: &[CachedTool]) -> Option<ToolCall> {
@@ -410,7 +454,8 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
 
             match response {
                 LLMResponse::TextAnswer(answer) => {
-                    if let Some(repaired) = self.repaired_tool_call_from_text(&answer, tools) {
+                    if self.repair_fallback_permitted() {
+                        if let Some(repaired) = self.repaired_tool_call_from_text(&answer, tools) {
                         debug!(
                             tool = %repaired.name,
                             "Orchestrator: Repaired ToolCall from TextAnswer"
@@ -424,6 +469,8 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
                             channel: GatewayChannel::Cli,
                             execution_contract: None,
                             retrieved_context: None,
+                            working_set: None,
+                            context_plan: None,
                         };
                         let mut uses_prompt_override = true;
                         let mut progress = ToolLoopProgress {
@@ -450,7 +497,7 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
                                 return Ok(res);
                             }
                         }
-                    } else if self.repair_fallback_permitted() {
+                        } else {
                         if let Some(tool_name) = extract_tool_name_candidate(&answer) {
                             rounds += 1;
                             if rounds > max_tool_rounds {
@@ -475,6 +522,7 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
                             continue;
                         } else {
                             return Ok(OrchestratorResult::Completed(answer));
+                        }
                         }
                     } else if let Some(tool_name) = extract_tool_name_candidate(&answer) {
                         rounds += 1;
@@ -506,6 +554,8 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
                         channel: GatewayChannel::Cli,
                         execution_contract: None,
                         retrieved_context: None,
+                        working_set: None,
+                        context_plan: None,
                     };
                     let mut uses_prompt_override = true;
                     let mut progress = ToolLoopProgress {
@@ -615,6 +665,12 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
                 }
 
                 if is_valid {
+                    self.run_before_tool_middlewares(
+                        progress.context_pack,
+                        ctx.tools_cache,
+                        ctx.tool_runtime_policy,
+                        &call,
+                    )?;
                     async_calls.push(call);
                 }
             }
@@ -666,10 +722,17 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
                 let rendered_output = render_tool_result_for_model(&call.name, &output);
                 debug!(tool = %call.name, output_len = rendered_output.len(), output_preview = %rendered_output.chars().take(100).collect::<String>(), "Tool: executed");
                 tool_results.push(format!("[Tool: {}] Result: {}", call.name, rendered_output));
-                executed_turns.push(ExecutedToolCall {
+                let executed = ExecutedToolCall {
                     call: call.clone(),
                     result: output.clone(),
-                });
+                };
+                self.run_after_tool_middlewares(
+                    progress.context_pack,
+                    ctx.tools_cache,
+                    ctx.tool_runtime_policy,
+                    &executed,
+                )?;
+                executed_turns.push(executed);
                 executed_tools.push((call.name, output));
             }
 
@@ -768,23 +831,25 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
             };
             match follow_up {
                 LLMResponse::TextAnswer(answer) => {
-                    if let Some(repaired) =
-                        self.repaired_tool_call_from_text(&answer, ctx.tools_cache)
-                    {
-                        *progress.context_pack = append_tool_results_to_context_pack(
-                            progress.context_pack,
-                            &executed_turns,
-                        );
-                        if *progress.uses_prompt_override {
-                            *progress.prompt =
-                                append_tool_results_to_prompt(progress.prompt, &executed_turns);
+                    if self.repair_fallback_permitted() {
+                        if let Some(repaired) =
+                            self.repaired_tool_call_from_text(&answer, ctx.tools_cache)
+                        {
+                            *progress.context_pack = append_tool_results_to_context_pack(
+                                progress.context_pack,
+                                &executed_turns,
+                            );
+                            if *progress.uses_prompt_override {
+                                *progress.prompt =
+                                    append_tool_results_to_prompt(progress.prompt, &executed_turns);
+                            }
+                            return Box::pin(self.process_generic_tool_calls(
+                                vec![repaired],
+                                progress,
+                                ctx,
+                            ))
+                            .await;
                         }
-                        return Box::pin(self.process_generic_tool_calls(
-                            vec![repaired],
-                            progress,
-                            ctx,
-                        ))
-                        .await;
                     }
                     return Ok(OrchestratorResult::Completed(answer));
                 }
@@ -870,6 +935,7 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
             request,
             history_context,
             rag_context,
+            initial_context_pack,
             history_messages,
             context_blocks,
             prompt_tools,
@@ -895,19 +961,21 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
             )
         };
         let arena = PromptArena::new();
-        let mut context_pack = PromptManager::build_execution_context_pack(
-            &arena,
-            agent_system_prompt,
-            request,
-            history_messages,
-            context_blocks.to_vec(),
-            &initial_tools,
-            model_capability.or(llm_capability_profile.as_ref()),
-            Some(tool_calling_mode_for_model_with_repair(
+        let mut context_pack = initial_context_pack.unwrap_or_else(|| {
+            PromptManager::build_execution_context_pack(
+                &arena,
+                agent_system_prompt,
+                request,
+                history_messages,
+                context_blocks.to_vec(),
+                &initial_tools,
                 model_capability.or(llm_capability_profile.as_ref()),
-                self.allow_repair_fallback,
-            )),
-        );
+                Some(tool_calling_mode_for_model_with_repair(
+                    model_capability.or(llm_capability_profile.as_ref()),
+                    self.allow_repair_fallback,
+                )),
+            )
+        });
         let mut prompt = PromptManager::render_execution_context_pack(&context_pack);
         let mut rounds = 0usize;
         let mut last_progress = std::time::Instant::now();
@@ -1026,100 +1094,103 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
             };
             match response {
                 LLMResponse::TextAnswer(answer) => {
-                    if let Some(repaired) =
-                        self.repaired_tool_call_from_text(&answer, &active_tools)
-                    {
-                        debug!(
-                            tool = %repaired.name,
-                            "Orchestrator: Repaired ToolCall from TextAnswer (dynamic)"
-                        );
-                        let calls = vec![repaired];
-                        let mut progress = ToolLoopProgress {
-                            rounds: &mut rounds,
-                            max_tool_rounds,
-                            prompt: &mut prompt,
-                            context_pack: &mut context_pack,
-                            uses_prompt_override: &mut uses_prompt_override,
-                            last_progress: &mut last_progress,
-                        };
-                        let ctx = DynamicToolLoopContext {
-                            steering_rx: steering_rx.as_deref_mut(),
-                            global_estop: global_estop.map(|a| a.as_ref()),
-                            cache,
-                            tool_registry,
-                            embedder,
-                            model_capability,
-                            tool_runtime_policy: &effective_tool_runtime_policy,
-                        };
-                        let res = self
-                            .process_dynamic_tool_calls(calls, &mut progress, ctx)
-                            .await?;
-                        if matches!(res, OrchestratorResult::ToolApprovalRequired { .. }) {
-                            return Ok(res);
-                        }
-                        if let OrchestratorResult::Completed(ref s) = res {
-                            if s != "CONTINUE_LOOP" {
+                    if self.repair_fallback_permitted() {
+                        if let Some(repaired) =
+                            self.repaired_tool_call_from_text(&answer, &active_tools)
+                        {
+                            debug!(
+                                tool = %repaired.name,
+                                "Orchestrator: Repaired ToolCall from TextAnswer (dynamic)"
+                            );
+                            let calls = vec![repaired];
+                            let mut progress = ToolLoopProgress {
+                                rounds: &mut rounds,
+                                max_tool_rounds,
+                                prompt: &mut prompt,
+                                context_pack: &mut context_pack,
+                                uses_prompt_override: &mut uses_prompt_override,
+                                last_progress: &mut last_progress,
+                            };
+                            let ctx = DynamicToolLoopContext {
+                                steering_rx: steering_rx.as_deref_mut(),
+                                global_estop: global_estop.map(|a| a.as_ref()),
+                                cache,
+                                tool_registry,
+                                embedder,
+                                model_capability,
+                                tool_runtime_policy: &effective_tool_runtime_policy,
+                            };
+                            let res = self
+                                .process_dynamic_tool_calls(calls, &mut progress, ctx)
+                                .await?;
+                            if matches!(res, OrchestratorResult::ToolApprovalRequired { .. }) {
                                 return Ok(res);
                             }
-                        }
-                    } else if self.repair_fallback_permitted() {
-                        let repair_mode = matches!(
-                            tool_calling_mode_for_model_with_repair(
-                                model_capability.or(llm_capability_profile.as_ref()),
-                                self.allow_repair_fallback,
-                            ),
-                            ToolCallingMode::TextFallbackWithRepair
-                        );
-                        if let Some(tool_name) = extract_tool_name_candidate(&answer) {
-                            rounds += 1;
-                            if rounds > max_tool_rounds {
-                                return Err(OrchestratorError::MaxRoundsExceeded {
-                                    limit: max_tool_rounds,
-                                });
+                            if let OrchestratorResult::Completed(ref s) = res {
+                                if s != "CONTINUE_LOOP" {
+                                    return Ok(res);
+                                }
                             }
-                            let available = active_tools
-                                .iter()
-                                .map(|t| t.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            let limitation =
-                                tool_mode_limitation_message(model_capability).unwrap_or_default();
-                            prompt = format!(
-                                "{}\n\n<<SYSTEM INTERRUPT: Tool '{}' is not available in this session. {} Use one of [{}], or answer in plain text. If using a tool, return only valid JSON.>>",
-                                prompt, tool_name, limitation, available
-                            );
-                            uses_prompt_override = true;
-                            last_progress = Instant::now();
-                            continue;
-                        } else if repair_mode
-                            && !enforced_tool_obligation
-                            && tool_selection_requires_tool_round(tool_selection)
-                            && !active_tools.is_empty()
-                        {
-                            rounds += 1;
-                            if rounds > max_tool_rounds {
-                                return Err(OrchestratorError::MaxRoundsExceeded {
-                                    limit: max_tool_rounds,
-                                });
-                            }
-                            enforced_tool_obligation = true;
-                            let available =
-                                selected_tool_names_for_obligation(tool_selection, &active_tools)
-                                    .join(", ");
-                            prompt = format!(
-                                "{}\n\n<<SYSTEM INTERRUPT: A relevant tool path is available for this request. Do not answer with a plan or promise. Either return a valid JSON tool call using one of [{}], or explain concretely why none of the available tools can satisfy the request.>>",
-                                prompt, available
-                            );
-                            uses_prompt_override = true;
-                            last_progress = Instant::now();
-                            continue;
                         } else {
-                            debug!(
-                                answer_len = answer.len(),
-                                answer_preview = %answer.chars().take(200).collect::<String>(),
-                                "Orchestrator: LLM returned TextAnswer"
+                            let repair_mode = matches!(
+                                tool_calling_mode_for_model_with_repair(
+                                    model_capability.or(llm_capability_profile.as_ref()),
+                                    self.allow_repair_fallback,
+                                ),
+                                ToolCallingMode::TextFallbackWithRepair
                             );
-                            return Ok(OrchestratorResult::Completed(answer));
+                            if let Some(tool_name) = extract_tool_name_candidate(&answer) {
+                                rounds += 1;
+                                if rounds > max_tool_rounds {
+                                    return Err(OrchestratorError::MaxRoundsExceeded {
+                                        limit: max_tool_rounds,
+                                    });
+                                }
+                                let available = active_tools
+                                    .iter()
+                                    .map(|t| t.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let limitation =
+                                    tool_mode_limitation_message(model_capability)
+                                        .unwrap_or_default();
+                                prompt = format!(
+                                    "{}\n\n<<SYSTEM INTERRUPT: Tool '{}' is not available in this session. {} Use one of [{}], or answer in plain text. If using a tool, return only valid JSON.>>",
+                                    prompt, tool_name, limitation, available
+                                );
+                                uses_prompt_override = true;
+                                last_progress = Instant::now();
+                                continue;
+                            } else if repair_mode
+                                && !enforced_tool_obligation
+                                && tool_selection_requires_tool_round(tool_selection)
+                                && !active_tools.is_empty()
+                            {
+                                rounds += 1;
+                                if rounds > max_tool_rounds {
+                                    return Err(OrchestratorError::MaxRoundsExceeded {
+                                        limit: max_tool_rounds,
+                                    });
+                                }
+                                enforced_tool_obligation = true;
+                                let available =
+                                    selected_tool_names_for_obligation(tool_selection, &active_tools)
+                                        .join(", ");
+                                prompt = format!(
+                                    "{}\n\n<<SYSTEM INTERRUPT: A relevant tool path is available for this request. Do not answer with a plan or promise. Either return a valid JSON tool call using one of [{}], or explain concretely why none of the available tools can satisfy the request.>>",
+                                    prompt, available
+                                );
+                                uses_prompt_override = true;
+                                last_progress = Instant::now();
+                                continue;
+                            } else {
+                                debug!(
+                                    answer_len = answer.len(),
+                                    answer_preview = %answer.chars().take(200).collect::<String>(),
+                                    "Orchestrator: LLM returned TextAnswer"
+                                );
+                                return Ok(OrchestratorResult::Completed(answer));
+                            }
                         }
                     } else if let Some(tool_name) = extract_tool_name_candidate(&answer) {
                         rounds += 1;
@@ -1242,6 +1313,12 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
                     pending_prompt: progress.prompt.clone(),
                 });
             } else {
+                self.run_before_tool_middlewares(
+                    progress.context_pack,
+                    &ctx.cache.active_tools(),
+                    ctx.tool_runtime_policy,
+                    &call,
+                )?;
                 async_calls.push(call);
             }
         }
@@ -1279,10 +1356,17 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
                 let rendered_output = render_tool_result_for_model(&call.name, &output);
                 debug!(tool = %call.name, output_len = rendered_output.len(), output_preview = %rendered_output.chars().take(100).collect::<String>(), "Tool: executed");
                 tool_results.push(format!("[Tool: {}] Result: {}", call.name, rendered_output));
-                executed_turns.push(ExecutedToolCall {
+                let executed = ExecutedToolCall {
                     call: call.clone(),
                     result: output.clone(),
-                });
+                };
+                self.run_after_tool_middlewares(
+                    progress.context_pack,
+                    &active_tools_snapshot,
+                    ctx.tool_runtime_policy,
+                    &executed,
+                )?;
+                executed_turns.push(executed);
                 executed_tools.push((call.name, output));
             }
 
@@ -1383,23 +1467,25 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
             };
             match follow_up {
                 LLMResponse::TextAnswer(answer) => {
-                    if let Some(repaired) =
-                        self.repaired_tool_call_from_text(&answer, &active_tools)
-                    {
-                        *progress.context_pack = append_tool_results_to_context_pack(
-                            progress.context_pack,
-                            &executed_turns,
-                        );
-                        if *progress.uses_prompt_override {
-                            *progress.prompt =
-                                append_tool_results_to_prompt(progress.prompt, &executed_turns);
+                    if self.repair_fallback_permitted() {
+                        if let Some(repaired) =
+                            self.repaired_tool_call_from_text(&answer, &active_tools)
+                        {
+                            *progress.context_pack = append_tool_results_to_context_pack(
+                                progress.context_pack,
+                                &executed_turns,
+                            );
+                            if *progress.uses_prompt_override {
+                                *progress.prompt =
+                                    append_tool_results_to_prompt(progress.prompt, &executed_turns);
+                            }
+                            return Box::pin(self.process_dynamic_tool_calls(
+                                vec![repaired],
+                                progress,
+                                ctx,
+                            ))
+                            .await;
                         }
-                        return Box::pin(self.process_dynamic_tool_calls(
-                            vec![repaired],
-                            progress,
-                            ctx,
-                        ))
-                        .await;
                     }
                     return Ok(OrchestratorResult::Completed(answer));
                 }
@@ -1460,7 +1546,7 @@ pub(crate) fn maybe_finalize_after_scheduler_tools(
     }
 }
 
-pub(crate) fn append_tool_results_to_prompt(
+pub fn append_tool_results_to_prompt(
     prompt: &str,
     executed_tools: &[ExecutedToolCall],
 ) -> String {
@@ -1481,7 +1567,7 @@ pub(crate) fn append_tool_results_to_prompt(
     )
 }
 
-pub(crate) fn append_tool_results_to_context_pack(
+pub fn append_tool_results_to_context_pack(
     pack: &aria_core::ExecutionContextPack,
     executed_tools: &[ExecutedToolCall],
 ) -> aria_core::ExecutionContextPack {
@@ -1500,11 +1586,33 @@ pub(crate) fn append_tool_results_to_context_pack(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    next.context_blocks.push(aria_core::ContextBlock {
-        kind: aria_core::ContextBlockKind::ToolInstructions,
-        label: "tool_results".into(),
-        token_estimate: content.split_whitespace().count() as u32,
-        content,
-    });
+    let label = if executed_tools.len() == 1 {
+        format!("tool_result_{}", executed_tools[0].call.name)
+    } else {
+        "tool_results".into()
+    };
+    if !next.context_blocks.iter().any(|block| {
+        block.label == label && matches!(block.kind, aria_core::ContextBlockKind::ToolResult)
+    }) {
+        next.context_blocks.push(aria_core::ContextBlock {
+            kind: aria_core::ContextBlockKind::ToolResult,
+            label,
+            token_estimate: content.split_whitespace().count() as u32,
+            content,
+        });
+    }
+    let working_set = next.working_set.get_or_insert_with(Default::default);
+    for entry in executed_tools
+        .iter()
+        .map(crate::working_set_entry_from_executed_tool)
+    {
+        if !working_set
+            .entries
+            .iter()
+            .any(|existing| existing.entry_id == entry.entry_id)
+        {
+            working_set.entries.push(entry);
+        }
+    }
     next
 }

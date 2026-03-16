@@ -720,12 +720,37 @@ impl TelegramState {
                 .unwrap()
                 .insert("parse_mode".to_string(), serde_json::json!(pm));
         }
-        if let Some(markup) = reply_markup {
+        if let Some(markup) = reply_markup.clone() {
             body.as_object_mut()
                 .unwrap()
                 .insert("reply_markup".to_string(), markup);
         }
         if let Err(err) = self.post_telegram_json("sendMessage", body).await {
+            if parse_mode.is_some() && err.contains("can't parse entities") {
+                warn!(
+                    chat_id = %chat_id,
+                    error = %err,
+                    "Telegram sendMessage parse error; retrying without parse_mode"
+                );
+                let mut plain_body = serde_json::json!({
+                    "chat_id": chat_id,
+                    "text": final_text
+                });
+                if let Some(markup) = reply_markup {
+                    plain_body
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("reply_markup".to_string(), markup);
+                }
+                if let Err(retry_err) = self.post_telegram_json("sendMessage", plain_body).await {
+                    error!(
+                        chat_id = %chat_id,
+                        error = %retry_err,
+                        "Telegram sendMessage plain-text retry failed"
+                    );
+                }
+                return;
+            }
             error!(chat_id = %chat_id, error = %err, "Telegram sendMessage error");
         }
     }
@@ -1581,29 +1606,23 @@ async fn process_one_telegram_update(state: &TelegramState, update_json: &str) {
                         return;
                     }
                 };
-                let tool_name = "approval".to_string();
-                let approved_tool_name = tool_name.clone();
-
-                let mut reply_msg = if approving {
-                    format!("✅ Tool '{}' approved. Executing...", tool_name)
-                } else {
-                    format!("❌ Tool '{}' denied. Resuming...", tool_name)
-                };
-                record_learning_reward(
-                    &state.config.learning,
-                    Path::new(&state.config.ssmu.sessions_dir),
-                    req.request_id,
-                    req.session_id,
-                    if approving {
-                        RewardKind::Accepted
-                    } else {
-                        RewardKind::Rejected
-                    },
-                    Some(format!("approval callback for tool {}", tool_name)),
-                    req.timestamp_us,
-                );
+                let reply_msg: String;
 
                 if let Ok(record) = resolve_approval_record(sessions_dir, &approval_id, decision) {
+                    let approved_tool_name = record.tool_name.clone();
+                    record_learning_reward(
+                        &state.config.learning,
+                        Path::new(&state.config.ssmu.sessions_dir),
+                        req.request_id,
+                        req.session_id,
+                        if approving {
+                            RewardKind::Accepted
+                        } else {
+                            RewardKind::Rejected
+                        },
+                        Some(format!("approval callback for tool {}", approved_tool_name)),
+                        req.timestamp_us,
+                    );
                     let original_request = record.original_request.clone();
                     if record.tool_name == AGENT_ELEVATION_TOOL_NAME {
                             let requested_agent =
@@ -1706,6 +1725,7 @@ async fn process_one_telegram_update(state: &TelegramState, update_json: &str) {
                         }
 
                         // We will execute the tool here if approved, or return the deny message
+                        let mut approved_execution_result: Option<ToolExecutionResult> = None;
                         let tool_result = if approving {
                             let args_str = record.arguments_json.clone();
 
@@ -1735,7 +1755,10 @@ async fn process_one_telegram_update(state: &TelegramState, update_json: &str) {
                             };
 
                             match executor.execute(&call).await {
-                                Ok(res) => res.render_for_prompt().to_string(),
+                                Ok(res) => {
+                                    approved_execution_result = Some(res.clone());
+                                    res.render_for_prompt().to_string()
+                                }
                                 Err(e) => format!("Tool execution failed: {}", e),
                             }
                         } else {
@@ -1743,168 +1766,90 @@ async fn process_one_telegram_update(state: &TelegramState, update_json: &str) {
                                 .render_for_prompt()
                                 .to_string()
                         };
-
-                        // Since we just need to get the LLM to reply, we can craft a fresh AgentRequest
-                        // containing the tool result block, acting as if the user sent it, but flag it
-                        let mut resume_req = req.clone();
-                        let mut resume_payload = String::new();
-                        if !original_request.trim().is_empty() {
-                            resume_payload.push_str(&original_request);
-                            resume_payload.push_str("\n\n");
-                        }
-                        resume_payload.push_str(&format!(
-                            "<TOOL_RESUME_BLOCK>\nTool '{}' completed with output:\n{}</TOOL_RESUME_BLOCK>",
-                            approved_tool_name, tool_result
-                        ));
-                        resume_req.content = aria_core::MessageContent::Text(resume_payload);
-
-                        // Spawn a new processor task with the resume request.
-                        // If the model asks for the same sensitive tool again immediately after resume,
-                        // auto-execute it and continue, instead of surfacing an internal loop artifact.
-                        let state_clone = state.clone();
-                        let approved_tool_name = approved_tool_name.clone();
-                        let original_request_for_resume = original_request.clone();
-                        tokio::spawn(async move {
-                                let mut current_req = resume_req;
-                                let mut auto_resume_hops = 0usize;
-                                const MAX_AUTO_RESUME_HOPS: usize = 3;
-
-                                loop {
-                                let run_result = process_request(
-                                    &current_req,
-                                    &state_clone.config.learning,
-                                    state_clone.router_index.as_ref(),
-                                    state_clone.embedder.as_ref(),
-                                    &state_clone.llm_pool,
-                                    &state_clone.cedar,
-                                    state_clone.agent_store.as_ref(),
-                                    state_clone.tool_registry.as_ref(),
-                                    state_clone.session_memory.as_ref(),
-                                    &state_clone.capability_index,
-                                    &state_clone.vector_store,
-                                    &state_clone.keyword_index,
-                                    &state_clone.firewall,
-                                    &state_clone.vault,
-                                    &state_clone.tx_cron,
-                                    &state_clone.provider_registry,
-                                    state_clone.session_tool_caches.as_ref(),
-                                    state_clone.hooks.as_ref(),
-                                    &state_clone.session_locks,
-                                    &state_clone.embed_semaphore,
-                                    state_clone.config.llm.max_tool_rounds,
-                                    None,
-                                    Some(&state_clone.global_estop),
-                                    std::path::Path::new(&state_clone.config.ssmu.sessions_dir),
-                                    state_clone.config.policy.whitelist.clone(),
-                                    state_clone.config.policy.forbid.clone(),
-                                    resolve_request_timezone_with_overrides(
-                                        &state_clone.config,
-                                        &current_req.user_id,
-                                        Some(state_clone.user_timezone_overrides.as_ref()),
-                                    ),
-                                )
-                                .await;
-
-                                match run_result {
-                                    Ok(aria_intelligence::OrchestratorResult::Completed(t)) => {
-                                        let text = if t.is_empty() {
-                                            "(no response)".to_string()
-                                        } else {
-                                            t
-                                        };
-                                        state_clone.send_telegram_agent_reply(chat_id, &text).await;
-                                        break;
-                                    }
-                                    Ok(aria_intelligence::OrchestratorResult::AgentElevationRequired {
-                                        message,
-                                        ..
-                                    }) => {
-                                        state_clone.send_telegram_agent_reply(chat_id, &message).await;
-                                        break;
-                                    }
-                                    Ok(aria_intelligence::OrchestratorResult::ToolApprovalRequired {
-                                        call,
-                                        ..
-                                    }) if call.name == approved_tool_name
-                                        && auto_resume_hops < MAX_AUTO_RESUME_HOPS =>
-                                    {
-                                        auto_resume_hops += 1;
-                                        debug!(
-                                            hop = auto_resume_hops,
-                                            tool = %call.name,
-                                            "Auto-resuming repeated approval-required tool in /approve flow"
-                                        );
-                                        let executor = MultiplexToolExecutor::new(
-                                            state_clone.vault.clone(),
-                                            "developer".to_string(),
-                                            current_req.session_id,
-                                            current_req.user_id.clone(),
-                                            current_req.channel,
-                                            state_clone.tx_cron.clone(),
-                                            state_clone.session_memory.as_ref().clone(),
-                                            state_clone.cedar.clone(),
-                                            Path::new(&state_clone.config.ssmu.sessions_dir).to_path_buf(),
-                                            None,
-                                            None,
-                                            resolve_request_timezone_with_overrides(
-                                                &state_clone.config,
-                                                &current_req.user_id,
-                                                Some(state_clone.user_timezone_overrides.as_ref()),
-                                            ),
-                                        );
-                                        let output = match executor.execute(&call).await {
-                                            Ok(out) => out.render_for_prompt().to_string(),
-                                            Err(e) => format!("Tool execution failed: {}", e),
-                                        };
-                                        let mut resumed = String::new();
-                                        if !original_request_for_resume.trim().is_empty() {
-                                            resumed.push_str(&original_request_for_resume);
-                                            resumed.push_str("\n\n");
-                                        }
-                                        resumed.push_str(&format!(
-                                                "<TOOL_RESUME_BLOCK>\nTool '{}' completed with output:\n{}</TOOL_RESUME_BLOCK>",
-                                                call.name, output
-                                            ));
-                                        current_req.content = aria_core::MessageContent::Text(resumed);
-                                        continue;
-                                    }
-                                    Ok(aria_intelligence::OrchestratorResult::ToolApprovalRequired {
-                                        call,
-                                        ..
-                                    }) => {
-                                        // Legitimate next approval (different tool or hop ceiling reached):
-                                        // surface it cleanly instead of a generic loop error.
-                                        state_clone
-                                            .send_telegram_secure_message(
-                                                chat_id,
-                                                &format!(
-                                                    "Another approval is required for tool `{}`. Please run the command again after approving that step.",
-                                                    call.name
-                                                ),
-                                                None,
-                                                None,
-                                            )
-                                            .await;
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        error!(error = %e, "Orchestrator error in spawned task");
-                                        let _ = state_clone
-                                            .send_telegram_secure_message(
-                                                chat_id,
-                                                &format!(
-                                                    "❌ <b>Orchestrator Error:</b>\n<pre>{}</pre>",
-                                                    e
-                                                ),
-                                                None,
-                                                Some("HTML"),
-                                            )
-                                            .await;
-                                        break;
-                                    }
-                                }
+                        let tool_result_text = if tool_result.trim().is_empty() {
+                            "(no tool output)".to_string()
+                        } else {
+                            tool_result
+                        };
+                        if approving {
+                            let output_preview: String = tool_result_text.chars().take(200).collect();
+                            debug!(
+                                tool = %approved_tool_name,
+                                output_preview = %output_preview,
+                                "Approval callback executed tool"
+                            );
+                            let approval_resolution_entry = aria_core::WorkingSetEntry {
+                                entry_id: format!("approval-{}", record.approval_id),
+                                kind: aria_core::WorkingSetEntryKind::PendingApproval,
+                                artifact_kind: execution_artifact_kind_for_tool(&record.tool_name),
+                                locator: serde_json::from_str::<serde_json::Value>(&record.arguments_json)
+                                    .ok()
+                                    .and_then(|payload| extract_locator_from_tool_payload(&payload)),
+                                operation: Some(record.tool_name.clone()),
+                                origin_tool: Some(record.tool_name.clone()),
+                                channel: Some(record.channel),
+                                session_id: Some(record.session_id),
+                                status: aria_core::WorkingSetStatus::Resolved,
+                                created_at_us: record.created_at_us,
+                                updated_at_us: Some(chrono::Utc::now().timestamp_micros() as u64),
+                                summary: format!("approval resolved for {}", record.tool_name),
+                                payload: serde_json::from_str(&record.arguments_json).ok(),
+                                approval_id: Some(record.approval_id.clone()),
+                            };
+                            let _ = RuntimeStore::for_sessions_dir(Path::new(
+                                &state.config.ssmu.sessions_dir,
+                            ))
+                            .append_working_set_entry(&approval_resolution_entry);
+                            if let Some(executed) = approved_execution_result.as_ref() {
+                                let artifacts = infer_execution_artifacts_from_turns(
+                                    &[ExecutedToolCall {
+                                        call: aria_intelligence::ToolCall {
+                                            invocation_id: None,
+                                            name: approved_tool_name.clone(),
+                                            arguments: record.arguments_json.clone(),
+                                        },
+                                        result: executed.clone(),
+                                    }],
+                                    &tool_result_text,
+                                );
+                                let entries = working_set_entries_from_artifacts(
+                                    session_uuid,
+                                    req.channel,
+                                    &artifacts,
+                                );
+                                persist_working_set_entries(
+                                    &RuntimeStore::for_sessions_dir(Path::new(
+                                        &state.config.ssmu.sessions_dir,
+                                    )),
+                                    &entries,
+                                );
                             }
-                        });
+                            let resume_block = format!(
+                                "<TOOL_RESUME_BLOCK>\nTool '{}' completed with output:\n{}</TOOL_RESUME_BLOCK>",
+                                approved_tool_name, tool_result_text
+                            );
+                            let resume_msg = aria_ssmu::Message {
+                                role: "user".into(),
+                                content: resume_block.clone(),
+                                timestamp_us: chrono::Utc::now().timestamp_micros() as u64,
+                            };
+                            let _ = state.session_memory.append(session_uuid, resume_msg.clone());
+                            let _ = state
+                                .session_memory
+                                .append_audit_event(
+                                    Path::new(&state.config.ssmu.sessions_dir),
+                                    &session_uuid,
+                                    &resume_msg,
+                                );
+                        }
+                        reply_msg = if approving {
+                            format!(
+                                "Approved tool '{}'.\n{}",
+                                approved_tool_name, tool_result_text
+                            )
+                        } else {
+                            format!("Denied tool '{}'.", approved_tool_name)
+                        };
                 } else {
                     reply_msg = "Expired or invalid approval state (record missing).".to_string();
                 }

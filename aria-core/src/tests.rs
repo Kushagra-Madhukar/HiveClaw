@@ -1177,6 +1177,8 @@ mod tests {
                 }],
                 dropped_blocks: vec![],
             }),
+            working_set: None,
+            context_plan: None,
         };
         let json = serde_json::to_string(&pack).expect("serialize");
         let decoded: ExecutionContextPack = serde_json::from_str(&json).expect("deserialize");

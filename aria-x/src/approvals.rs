@@ -354,8 +354,7 @@ fn build_approval_descriptor(record: &aria_core::ApprovalRecord) -> ApprovalDisp
         "set_domain_access_decision" => "medium: changes future trust decisions".to_string(),
         _ => "medium: explicit human approval required".to_string(),
     };
-    let arguments_preview = serde_json::to_string_pretty(&args)
-        .unwrap_or_else(|_| record.arguments_json.clone());
+    let arguments_preview = approval_arguments_preview(&record.tool_name, &args);
     ApprovalDisplayDescriptor {
         approval_id: record.approval_id.clone(),
         tool_name: record.tool_name.clone(),
@@ -368,21 +367,61 @@ fn build_approval_descriptor(record: &aria_core::ApprovalRecord) -> ApprovalDisp
     }
 }
 
+fn approval_arguments_preview(tool_name: &str, args: &serde_json::Value) -> String {
+    let mut map = serde_json::Map::new();
+    let keep = match tool_name {
+        "write_file" => vec!["path", "content"],
+        "run_shell" => vec!["command"],
+        "manage_cron" => vec!["action", "id", "prompt", "schedule", "agent_id"],
+        "set_reminder" | "schedule_message" => {
+            vec!["task", "schedule", "mode", "deferred_prompt", "agent_id"]
+        }
+        "browser_act" => vec!["action", "url", "selector", "text", "value", "millis"],
+        "browser_download" | "browser_open" | "browser_snapshot" | "browser_extract" | "browser_screenshot" => {
+            vec!["url", "filename", "browser_session_id", "profile_id"]
+        }
+        _ => Vec::new(),
+    };
+    if let Some(obj) = args.as_object() {
+        if keep.is_empty() {
+            map = obj.clone();
+        } else {
+            for key in keep {
+                if let Some(value) = obj.get(key) {
+                    if key == "content" {
+                        let content = value.as_str().unwrap_or_default();
+                        let preview = if content.len() > 240 {
+                            format!("{}... ({} chars)", &content[..240], content.len())
+                        } else {
+                            content.to_string()
+                        };
+                        map.insert("content_preview".into(), serde_json::Value::String(preview));
+                    } else {
+                        map.insert(key.to_string(), value.clone());
+                    }
+                }
+            }
+        }
+    }
+    serde_json::to_string_pretty(&serde_json::Value::Object(map))
+        .unwrap_or_else(|_| "{}".to_string())
+}
+
 fn format_approval_message(record: &aria_core::ApprovalRecord) -> String {
     let descriptor = build_approval_descriptor(record);
     let target = descriptor
         .target_summary
         .as_ref()
-        .map(|value| format!("\nTarget: `{}`", value))
+        .map(|value| format!("\nTarget: {}", value))
         .unwrap_or_default();
     let options = descriptor
         .options
         .iter()
-        .map(|value| format!("`{}`", value))
+        .map(|value| value.to_string())
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "⚠️ **Approval Required**\n\nAction: {}\nAgent: `{}`{}\nRisk: {}\n\nArguments:\n```json\n{}\n```\nOptions: {}",
+        "Approval required\n\nAction: {}\nAgent: {}{}\nRisk: {}\n\nArguments:\n{}\n\nOptions: {}",
         descriptor.action_summary,
         descriptor.agent_id,
         target,
@@ -426,7 +465,7 @@ fn render_approval_prompt_for_channel(
             ]];
             ApprovalRenderOutput {
                 text: base_text,
-                parse_mode: Some("Markdown"),
+                parse_mode: None,
                 reply_markup: Some(serde_json::json!({ "inline_keyboard": keyboard })),
             }
         }
@@ -436,6 +475,32 @@ fn render_approval_prompt_for_channel(
             reply_markup: None,
         },
     }
+}
+
+fn persist_pending_approval_working_set_entry(
+    sessions_dir: &Path,
+    record: &aria_core::ApprovalRecord,
+) {
+    let locator = serde_json::from_str::<serde_json::Value>(&record.arguments_json)
+        .ok()
+        .and_then(|payload| extract_locator_from_tool_payload(&payload));
+    let entry = aria_core::WorkingSetEntry {
+        entry_id: format!("approval-{}", record.approval_id),
+        kind: aria_core::WorkingSetEntryKind::PendingApproval,
+        artifact_kind: execution_artifact_kind_for_tool(&record.tool_name),
+        locator,
+        operation: Some(record.tool_name.clone()),
+        origin_tool: Some(record.tool_name.clone()),
+        channel: Some(record.channel),
+        session_id: Some(record.session_id),
+        status: aria_core::WorkingSetStatus::Pending,
+        created_at_us: record.created_at_us,
+        updated_at_us: None,
+        summary: build_approval_descriptor(record).action_summary,
+        payload: serde_json::from_str(&record.arguments_json).ok(),
+        approval_id: Some(record.approval_id.clone()),
+    };
+    let _ = RuntimeStore::for_sessions_dir(sessions_dir).append_working_set_entry(&entry);
 }
 
 fn persist_pending_approval_for_result(
@@ -448,6 +513,7 @@ fn persist_pending_approval_for_result(
             let record = build_agent_elevation_approval_record(req, agent_id);
             write_approval_record(sessions_dir, &record)
                 .map_err(|e| format!("write approval record failed: {}", e))?;
+            persist_pending_approval_working_set_entry(sessions_dir, &record);
             let handle = ensure_approval_handle(sessions_dir, &record)
                 .map_err(|e| format!("approval handle allocation failed: {}", e))?;
             let text = format!(
@@ -468,6 +534,7 @@ fn persist_pending_approval_for_result(
             let record = build_tool_approval_record(req, call, pending_prompt.clone());
             write_approval_record(sessions_dir, &record)
                 .map_err(|e| format!("write approval record failed: {}", e))?;
+            persist_pending_approval_working_set_entry(sessions_dir, &record);
             let handle = ensure_approval_handle(sessions_dir, &record)
                 .map_err(|e| format!("approval handle allocation failed: {}", e))?;
             let text = format!(
@@ -495,6 +562,7 @@ fn persist_pending_approval_for_error(
     let record = build_domain_access_approval_record(req, &domain, action_family);
     write_approval_record(sessions_dir, &record)
         .map_err(|e| format!("write approval record failed: {}", e))?;
+    persist_pending_approval_working_set_entry(sessions_dir, &record);
     let handle = ensure_approval_handle(sessions_dir, &record)
         .map_err(|e| format!("approval handle allocation failed: {}", e))?;
     let text = format!(

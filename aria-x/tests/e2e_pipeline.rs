@@ -444,6 +444,7 @@ async fn dynamic_tool_hotswap_integration_path() {
             request: &req,
             history_context: "",
             rag_context: "",
+                initial_context_pack: None,
             history_messages: &[],
             context_blocks: &[],
             prompt_tools: None,

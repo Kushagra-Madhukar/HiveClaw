@@ -2811,6 +2811,8 @@ mod tests {
                 channel: aria_core::GatewayChannel::Cli,
                 execution_contract: None,
                 retrieved_context: None,
+            working_set: None,
+            context_plan: None,
             },
             rendered_prompt: "rendered".into(),
             created_at_us: 99,
@@ -2949,5 +2951,34 @@ mod tests {
             .list_durable_dlq(DurableQueueKind::Outbox, "tenant-a", "workspace-a")
             .expect("list dlq after");
         assert!(dlq_after.is_empty());
+    }
+
+    #[test]
+    fn runtime_store_round_trips_working_set_entries() {
+        let (_dir, store) = temp_store();
+        let session_id = uuid::Uuid::new_v4();
+        let entry = aria_core::WorkingSetEntry {
+            entry_id: "ws-1".into(),
+            kind: aria_core::WorkingSetEntryKind::Artifact,
+            artifact_kind: Some(aria_core::ExecutionArtifactKind::File),
+            locator: Some("hello.js".into()),
+            operation: Some("write_file".into()),
+            origin_tool: Some("write_file".into()),
+            channel: Some(aria_core::GatewayChannel::Cli),
+            session_id: Some(*session_id.as_bytes()),
+            status: aria_core::WorkingSetStatus::Completed,
+            created_at_us: 42,
+            updated_at_us: None,
+            summary: "created hello.js".into(),
+            payload: Some(serde_json::json!({"path":"hello.js"})),
+            approval_id: None,
+        };
+        store
+            .append_working_set_entry(&entry)
+            .expect("append working set entry");
+        let loaded = store
+            .list_working_set_entries(&session_id.to_string(), 10)
+            .expect("list working set entries");
+        assert_eq!(loaded, vec![entry]);
     }
 }

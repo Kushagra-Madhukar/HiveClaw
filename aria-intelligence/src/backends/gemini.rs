@@ -639,6 +639,8 @@ mod tests {
             channel: aria_core::GatewayChannel::Cli,
             execution_contract: None,
             retrieved_context: None,
+            working_set: None,
+            context_plan: None,
         }
     }
 

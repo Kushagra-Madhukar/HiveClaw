@@ -221,6 +221,12 @@ CREATE TABLE IF NOT EXISTS request_policy_audits (
     payload_json TEXT NOT NULL,
     created_at_us INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS working_set_entries (
+    entry_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS repair_fallback_audits (
     audit_id TEXT PRIMARY KEY,
     request_id TEXT NOT NULL,

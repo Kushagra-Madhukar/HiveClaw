@@ -572,6 +572,8 @@ mod tests {
             channel: aria_core::GatewayChannel::Cli,
             execution_contract: None,
             retrieved_context: None,
+            working_set: None,
+            context_plan: None,
         }
     }
 
@@ -635,6 +637,7 @@ mod tests {
         let provider = OpenAiProvider {
             api_key: SecretRef::Literal(String::from("test-key")),
             base_url: String::from("https://api.openai.com/v1"),
+            egress_broker: None,
         };
 
         let observed_at_us = 1_234_567;
@@ -655,6 +658,7 @@ mod tests {
         let provider = OpenAiProvider {
             api_key: SecretRef::Literal(String::from("test-key")),
             base_url: String::from("https://api.openai.com/v1"),
+            egress_broker: None,
         };
 
         let probe = provider
