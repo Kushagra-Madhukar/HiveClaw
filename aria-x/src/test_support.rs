@@ -13828,7 +13828,7 @@ exit 0
             runtime,
         };
         let summary = render_doctor_summary(&cfg);
-        assert!(summary.contains("ARIA-X doctor"));
+        assert!(summary.contains("RoboClaw doctor"));
         assert!(summary.contains("runtime_status:"));
         assert!(summary.contains("configured_channels:"));
         assert!(summary.contains("stt_effective_mode:"));

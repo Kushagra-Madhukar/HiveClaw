@@ -1,6 +1,6 @@
 //! # aria-core
 //!
-//! Foundational types for the ARIA-X architecture.
+//! Foundational types for the RoboClaw architecture.
 //! This crate is `#![no_std]` compatible with the `alloc` crate.
 //!
 //! ## Types

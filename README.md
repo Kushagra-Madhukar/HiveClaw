@@ -1,4 +1,4 @@
-# ARIA-X/RoboClaw
+# RoboClaw
 
 ![Rust](https://img.shields.io/badge/Rust-Workspace-000000?logo=rust)
 ![Status](https://img.shields.io/badge/status-alpha-orange)
@@ -6,7 +6,7 @@
 ![Runtime](https://img.shields.io/badge/runtime-SQLite--first-2ea44f)
 ![Security](https://img.shields.io/badge/security-policy--gated-critical)
 
-ARIA-X is a local-first, multi-agent runtime and gateway platform written in Rust. It combines agent orchestration, policy enforcement, tool execution, retrieval, scheduling, browser automation, MCP integration, and multi-channel ingress into one cohesive system.
+RoboClaw is a local-first, multi-agent runtime and gateway platform written in Rust. It combines agent orchestration, policy enforcement, tool execution, retrieval, scheduling, browser automation, MCP integration, and multi-channel ingress into one cohesive system.
 
 The project is designed around a practical constraint set:
 
@@ -16,11 +16,11 @@ The project is designed around a practical constraint set:
 - human-in-the-loop approvals for risky actions
 - multi-channel operation without turning the core runtime into channel-specific code
 
-> ARIA-X is not a chat wrapper. It is an agent runtime with durable state, explicit policy boundaries, tool orchestration, background jobs, and operator visibility.
+> RoboClaw is not a chat wrapper. It is an agent runtime with durable state, explicit policy boundaries, tool orchestration, background jobs, and operator visibility.
 
 ## Table of Contents
 
-- [What ARIA-X Is](#what-aria-x-is)
+- [What RoboClaw Is](#what-roboclaw-is)
 - [Current Platform Scope](#current-platform-scope)
 - [Architecture](#architecture)
 - [Runtime Flow](#runtime-flow)
@@ -36,9 +36,9 @@ The project is designed around a practical constraint set:
 - [Development](#development)
 - [License](#license)
 
-## What ARIA-X Is
+## What RoboClaw Is
 
-ARIA-X is a Rust workspace for building and running:
+RoboClaw is a Rust workspace for building and running:
 
 - multi-agent systems with explicit capability profiles
 - policy-gated tool execution
@@ -167,7 +167,7 @@ The current runtime path is:
 | `aria-safety` | Leak pattern scanning and safety utilities |
 | `aria-vault` | Encrypted secret storage and protected state access |
 | `aria-mesh` | Optional distributed topology / mesh transport layer |
-| `aria-x` | Main binary: runtime composition, operator surfaces, TUI, scheduler |
+| `roboclaw` | Main binary: runtime composition, operator surfaces, TUI, scheduler |
 | `agents/` | Agent capability profiles and role configuration |
 | `nodes/` | Node-role configuration examples |
 | `docs/` | Architecture, migration, audit, and planning documents |
@@ -227,7 +227,7 @@ The current runtime path is:
 
 ## Channels and Interaction Surfaces
 
-ARIA-X separates transport concerns from core runtime behavior.
+RoboClaw separates transport concerns from core runtime behavior.
 
 ### Implemented and used in the current platform
 
@@ -365,7 +365,7 @@ If you want to switch providers later, change the `[llm]` block in [`aria-x/conf
 
 ### Speech-to-text modes
 
-ARIA-X supports:
+RoboClaw supports:
 
 - `auto`: prefer local STT when available, otherwise use configured cloud STT, otherwise stay off
 - `local`: require a valid local Whisper runtime
@@ -455,7 +455,7 @@ target/debug/aria-x tui aria-x/config.toml --attach ws://127.0.0.1:8090/ws
 
 ## Security Model
 
-ARIA-X is built around runtime-enforced boundaries, not prompt-only instructions.
+RoboClaw is built around runtime-enforced boundaries, not prompt-only instructions.
 
 ### Enforcement layers
 
@@ -596,6 +596,6 @@ Keep these local-only:
 
 ## License
 
-ARIA-X is licensed under the GNU Affero General Public License v3.0 or later.
+RoboClaw is licensed under the GNU Affero General Public License v3.0 or later.
 
 See [LICENSE](LICENSE) for the full license text.

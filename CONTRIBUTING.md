@@ -1,4 +1,4 @@
-# Contributing to ARIA-X
+# Contributing to RoboClaw
 
 Thanks for your interest in contributing.
 

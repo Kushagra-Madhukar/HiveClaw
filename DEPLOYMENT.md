@@ -1,4 +1,4 @@
-# ARIA-X Production Deployment Guide
+# RoboClaw Production Deployment Guide
 
 This guide walks you through building the production bundle and connecting it to Telegram and Ollama.
 
@@ -19,11 +19,11 @@ This guide walks you through building the production bundle and connecting it to
 Or manually:
 
 ```bash
-cargo build --release -p aria-x
-# Binary: target/release/aria-x
+cargo build --release -p roboclaw
+# Binary: target/release/roboclaw
 ```
 
-The script creates `dist/aria-x-<os>-<arch>/` with the binary, config templates, policies, and agents.
+The script creates `dist/roboclaw-<os>-<arch>/` with the binary, config templates, policies, and agents.
 
 ## 3. Set Up Ollama
 
@@ -91,7 +91,7 @@ sessions_dir = "./workspace/sessions"
 | `~/.aria/.env` or `./.env` | Persistent env (e.g. `TELEGRAM_BOT_TOKEN=...`) |
 | `telegram_token_file = "/path"` | Docker secrets, k8s secret mounts |
 
-Example `.env` (in project dir or `~/.aria/`):
+Example `.env` (in project dir or `~/.roboclaw/`):
 
 ```
 TELEGRAM_BOT_TOKEN=123456789:ABCdef...
@@ -112,8 +112,8 @@ OLLAMA_HOST=http://localhost:11434
 # Install ngrok
 brew install ngrok
 
-# Start ARIA-X
-./aria-x config.toml
+# Start RoboClaw
+./roboclaw config.toml
 
 # In another terminal, expose port 8080
 ngrok http 8080
@@ -168,24 +168,24 @@ RUST_LOG=aria_x=debug ./aria-x config.toml 2>&1 | tee aria.log
 
 **RUST_LOG** overrides config. Examples: `aria_x=info`, `aria_x=debug`, `debug` (everything).
 
-## 6. Run ARIA-X
+## 6. Run RoboClaw
 
 ```bash
 # From bundle directory
 ./run.sh
 
 # Or with env overrides
-TELEGRAM_BOT_TOKEN=xxx RUST_LOG=debug ./aria-x config.toml
+TELEGRAM_BOT_TOKEN=xxx RUST_LOG=debug ./roboclaw config.toml
 ```
 
 Expected output:
 
 ```
-[aria-x] Loading config from: config.toml
-[aria-x] Config loaded (node=orchestrator-1 role=orchestrator tier=orchestrator | LLM: openrouter/arcee-ai/trinity-large-preview:free)
-[aria-x] LLM: OpenRouter (model=arcee-ai/trinity-large-preview:free)
-[aria-x] ✅ Telegram gateway listening on http://0.0.0.0:8080/webhook
-[aria-x] Set webhook: https://api.telegram.org/bot<TOKEN>/setWebhook?url=<YOUR_URL>/webhook
+[roboclaw] Loading config from: config.toml
+[roboclaw] Config loaded (node=orchestrator-1 role=orchestrator tier=orchestrator | LLM: openrouter/arcee-ai/trinity-large-preview:free)
+[roboclaw] LLM: OpenRouter (model=arcee-ai/trinity-large-preview:free)
+[roboclaw] ✅ Telegram gateway listening on http://0.0.0.0:8080/webhook
+[roboclaw] Set webhook: https://api.telegram.org/bot<TOKEN>/setWebhook?url=<YOUR_URL>/webhook
 ```
 
 ## 7. Test

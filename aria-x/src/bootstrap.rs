@@ -1236,7 +1236,7 @@ async fn actual_main() {
         reg.register(Arc::new(backends::openrouter::OpenRouterProvider {
             api_key: openrouter_key,
             site_url: "aria-x".into(),
-            site_title: "ARIA-X".into(),
+            site_title: "RoboClaw".into(),
             egress_broker: Some(provider_egress_broker.clone()),
         }));
         reg.register(Arc::new(backends::openai::OpenAiProvider {
@@ -2666,18 +2666,18 @@ fn run_process_control_command(args: &[String]) -> Option<Result<String, String>
 
 fn render_runtime_status() -> Result<String, String> {
     let Some(record) = read_runtime_pid_record()? else {
-        return Ok("ARIA-X is not running.".into());
+        return Ok("RoboClaw is not running.".into());
     };
     if process_is_alive(record.pid) {
         Ok(format!(
-            "ARIA-X is running.\npid: {}\nconfig: {}",
+            "RoboClaw is running.\npid: {}\nconfig: {}",
             record.pid, record.config_path
         ))
     } else {
         let path = runtime_pid_path()?;
         let _ = std::fs::remove_file(&path);
         Ok(format!(
-            "ARIA-X is not running, but a stale pid file was found and removed.\nstale_pid: {}\nconfig: {}",
+            "RoboClaw is not running, but a stale pid file was found and removed.\nstale_pid: {}\nconfig: {}",
             record.pid, record.config_path
         ))
     }
@@ -2685,13 +2685,13 @@ fn render_runtime_status() -> Result<String, String> {
 
 fn stop_runtime_process() -> Result<String, String> {
     let Some(record) = read_runtime_pid_record()? else {
-        return Ok("ARIA-X is not running.".into());
+        return Ok("RoboClaw is not running.".into());
     };
     if !process_is_alive(record.pid) {
         let path = runtime_pid_path()?;
         let _ = std::fs::remove_file(&path);
         return Ok(format!(
-            "ARIA-X was not running. Removed stale pid file for pid {}.",
+            "RoboClaw was not running. Removed stale pid file for pid {}.",
             record.pid
         ));
     }
@@ -2708,7 +2708,7 @@ fn stop_runtime_process() -> Result<String, String> {
                 record.pid, status
             ));
         }
-        Ok(format!("Sent SIGTERM to ARIA-X process {}.", record.pid))
+        Ok(format!("Sent SIGTERM to RoboClaw process {}.", record.pid))
     }
     #[cfg(not(unix))]
     {
@@ -2782,7 +2782,7 @@ fn render_doctor_summary(config: &ResolvedAppConfig) -> String {
         .unwrap_or(false);
 
     format!(
-        "ARIA-X doctor\n\
+        "RoboClaw doctor\n\
          runtime_status:\n{}\n\
          config_path: {}\n\
          llm_backend: {}\n\
