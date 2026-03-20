@@ -5,8 +5,21 @@
 ![Architecture](https://img.shields.io/badge/architecture-local--first-blue)
 ![Runtime](https://img.shields.io/badge/runtime-SQLite--first-2ea44f)
 ![Security](https://img.shields.io/badge/security-policy--gated-critical)
+![Swarm](https://img.shields.io/badge/swarm-hive--mind-black)
+![Robotics](https://img.shields.io/badge/robotics-ROS2%20ready-6f42c1)
+![Mesh](https://img.shields.io/badge/mesh-multi--system-0a7ea4)
 
-HiveClaw is a local-first, multi-agent runtime and gateway platform written in Rust. It combines agent orchestration, policy enforcement, tool execution, retrieval, scheduling, browser automation, MCP integration, and multi-channel ingress into one cohesive system.
+HiveClaw is a local-first, multi-agent runtime, gateway, and emerging hive-mind control plane written in Rust. It combines agent orchestration, policy enforcement, tool execution, retrieval, scheduling, browser automation, MCP integration, robotics interfaces, and multi-channel ingress into one cohesive system.
+
+If you are evaluating projects like OpenClaw, agent gateways, coding-agent runtimes, swarm orchestrators, robotics control planes, or local-first alternatives to hosted AI wrappers, HiveClaw is the project to inspect.
+
+It is designed to become a **hive mind for parallel systems**:
+
+- one runtime coordinating many agents
+- one control plane spanning many channels
+- one operator surface spanning many machines
+- one policy boundary spanning tools, browsers, files, MCP, and future robot executors
+- one mesh-capable architecture that can grow into swarm and fleet operations
 
 The project is designed around a practical constraint set:
 
@@ -18,10 +31,52 @@ The project is designed around a practical constraint set:
 
 > HiveClaw is not a chat wrapper. It is an agent runtime with durable state, explicit policy boundaries, tool orchestration, background jobs, and operator visibility.
 
+## Why HiveClaw
+
+Most AI agent projects stop at one of these layers:
+
+- a chatbot wrapper
+- a single-agent CLI
+- a provider-specific tool loop
+- a hosted SaaS orchestration UI
+- a robotics stack with no modern agent runtime
+
+HiveClaw is aiming at the harder target: a **local-first agent platform** that can coordinate tools, channels, scheduled work, browsers, operator approvals, mesh-connected runtimes, and eventually robot/ROS2 execution under one system design.
+
+That makes it relevant if you want:
+
+- a serious OpenClaw alternative in Rust
+- a local-first coding-agent runtime
+- a swarm-ready agent orchestration base
+- a bridge between software agents and robotics control
+- a system that can run on laptops, nodes, edge devices, and future robot companions
+
+## Positioning
+
+HiveClaw is being built as:
+
+- a local-first agent runtime
+- a multi-agent gateway
+- a capability-gated tool execution platform
+- a future hive-mind layer for multi-system coordination
+- a robotics-aware runtime with ROS2 and mesh expansion paths
+
+It is not being built as:
+
+- a thin chat frontend over a hosted model
+- a prompt-only automation wrapper
+- a Python-only orchestration script pile
+- a one-surface bot with hardcoded transport logic
+- a robotics stack that ignores modern LLM and tool-loop constraints
+
 ## Table of Contents
 
+- [Why HiveClaw](#why-hiveclaw)
+- [Positioning](#positioning)
 - [What HiveClaw Is](#what-hiveclaw-is)
+- [Who It Is For](#who-it-is-for)
 - [Current Platform Scope](#current-platform-scope)
+- [Hive Mind Direction](#hive-mind-direction)
 - [Architecture](#architecture)
 - [Runtime Flow](#runtime-flow)
 - [Workspace Layout](#workspace-layout)
@@ -47,9 +102,22 @@ HiveClaw is a Rust workspace for building and running:
 - scheduled jobs and reminders
 - browser-assisted web access and automation
 - MCP client-side integration
+- optional mesh-connected node topologies
+- ROS2-adjacent and robotics-aware execution surfaces
 - learning and audit traces for future self-improvement workflows
 
 It is built as a modular workspace so the runtime can evolve without collapsing into one large binary with implicit behavior.
+
+## Who It Is For
+
+HiveClaw is for builders who need more than a single coding assistant:
+
+- engineers building local-first agent products
+- teams that want one runtime behind TUI, Telegram, WebSocket, and future channels
+- operators who need approvals, audits, retrieval, and durable runs
+- researchers experimenting with agent swarms and multi-agent delegation
+- robotics and embodied-AI builders who want a path from software agents to ROS2 and robot fleets
+- edge-device and low-resource deployments that cannot afford bloated cloud-first stacks
 
 ## Current Platform Scope
 
@@ -71,6 +139,37 @@ It is built as a modular workspace so the runtime can evolve without collapsing 
 - production-style architecture, alpha product stage
 - core local/node runtime validated
 - cluster-scale backend remains intentionally deferred
+
+## Hive Mind Direction
+
+HiveClaw is intentionally being shaped toward a bigger target than a single-node assistant runtime.
+
+### Near-term direction
+
+- stronger multi-agent coordination
+- better multi-node execution over the mesh layer
+- more capable background runs and delegated work
+- better operator visibility over concurrent runs and approvals
+- deeper MCP and external-system integration
+
+### Strategic direction
+
+- act as a hive mind across multiple systems and surfaces
+- coordinate parallel workers across machines, devices, and channels
+- operate as a swarm runtime rather than a single-session assistant
+- mediate between software agents, external tools, browser actors, and robotics executors
+- support robot-adjacent and ROS2-based workflows without abandoning the local-first runtime core
+
+### Robotics and fleet direction
+
+The long-term intent is for HiveClaw to work not only as a software agent runtime, but also as a robotics-aware coordination layer:
+
+- ROS2 bridge integration
+- robot-state-aware planning
+- high-level robotics contracts instead of unsafe direct actuator prompting
+- policy-gated robot operations
+- mesh-connected robot and companion-node communication
+- future native deployment paths on robot-class hardware and constrained edge systems
 
 ## Architecture
 
@@ -182,6 +281,7 @@ The current runtime path is:
 - parent/child run graph and mailbox persistence
 - bounded background execution
 - capability ceilings enforced in code
+- execution model designed to scale toward swarm and hive-mind coordination
 
 ### Tool execution
 
@@ -213,6 +313,15 @@ The current runtime path is:
 - Telegram integration
 - TUI client over the shared runtime
 - channel onboarding/status commands
+- architecture intended to let one HiveClaw runtime coordinate many surfaces in parallel
+
+### Mesh, swarm, and robotics direction
+
+- optional mesh transport layer for distributed node topologies
+- ROS2 bridge surface already present in the workspace
+- robotics prompt and contract primitives already present in core/intelligence layers
+- path toward multi-device, multi-robot, and companion-node coordination
+- long-term target: one HiveClaw runtime acting as the hive mind across many systems
 
 ### Operator visibility
 
