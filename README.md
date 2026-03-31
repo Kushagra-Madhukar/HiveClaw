@@ -108,6 +108,7 @@ HiveClaw is a Rust workspace for building and running:
 - scheduled jobs and reminders
 - browser-assisted web access and automation
 - MCP client-side integration
+- Chrome DevTools MCP onboarding for Chrome-backed browser access through MCP
 - optional mesh-connected node topologies
 - ROS2-adjacent and robotics-aware execution surfaces
 - learning and audit traces for future self-improvement workflows
@@ -138,6 +139,7 @@ HiveClaw is for builders who need more than a single coding assistant:
 - background runs, reminders, and scheduler flow
 - browser profile/session state with encrypted persistence support
 - MCP subsystem boundary and runtime integration
+- Chrome DevTools MCP can be registered and synced as a browser-facing MCP provider, with managed-launch and attach-to-existing-session modes
 - skills/runtime foundation with policy gating
 
 ### Current maturity
@@ -304,6 +306,19 @@ The current runtime path is:
 - login state and session persistence
 - screenshot capture and browser action execution
 - browser activity auditing
+- optional Chrome DevTools MCP integration for live DevTools-backed browser access
+
+See [docs/CHROME_DEVTOOLS_MCP.md](docs/CHROME_DEVTOOLS_MCP.md) for the setup flow.
+
+Operator commands:
+
+```bash
+aria-x doctor mcp
+aria-x doctor mcp --live
+aria-x doctor mcp --live --mode auto_connect
+aria-x setup chrome-devtools-mcp --agent developer
+aria-x setup chrome-devtools-mcp --mode auto_connect --agent developer
+```
 
 ### Scheduling and background work
 
@@ -595,6 +610,7 @@ HiveClaw is built around runtime-enforced boundaries, not prompt-only instructio
 
 Start here if you want the deeper architecture and planning trail:
 
+- [`docs/HIVECLAW_EXECUTION_ROADMAP.md`](docs/HIVECLAW_EXECUTION_ROADMAP.md)
 - [`docs/architecture/README.md`](docs/architecture/README.md)
 - [`docs/REPO_CONTEXT_MAP.md`](docs/REPO_CONTEXT_MAP.md)
 - [`docs/ARCHITECTURAL_CHANGES.md`](docs/ARCHITECTURAL_CHANGES.md)
