@@ -57,6 +57,7 @@ fn render_cli_help(topic: Option<&str>) -> String {
             "  aria-x doctor env",
             "  aria-x doctor gateway",
             "  aria-x doctor browser",
+            "  aria-x doctor mcp [--live] [--mode <launch_managed|auto_connect>]",
             "",
             "Commands:",
             "  doctor         Show a runtime/operator health summary.",
@@ -64,6 +65,9 @@ fn render_cli_help(topic: Option<&str>) -> String {
             "  doctor env     Show resolved local environment/runtime input status.",
             "  doctor gateway Show configured gateway/channel status.",
             "  doctor browser Show browser automation/runtime configuration status.",
+            "  doctor mcp     Show MCP runtime readiness and Chrome DevTools MCP status.",
+            "                   With --live, perform a real Chrome DevTools MCP handshake probe.",
+            "                   Use --mode auto_connect to probe the active Chrome session.",
         ]
         .join("\n"),
         Some(topic) if topic == "install" => [
@@ -145,6 +149,16 @@ fn render_cli_help(topic: Option<&str>) -> String {
             "Starts the terminal UI. Without --attach it spawns a local runtime.",
         ]
         .join("\n"),
+        Some(topic) if topic == "setup" => [
+            "aria-x setup",
+            "",
+            "Usage:",
+            "  aria-x setup stt --local",
+            "  aria-x setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>]",
+            "",
+            "Setup commands bootstrap optional runtime integrations.",
+        ]
+        .join("\n"),
         _ => [
             "aria-x",
             "",
@@ -160,6 +174,7 @@ fn render_cli_help(topic: Option<&str>) -> String {
             "  aria-x doctor env",
             "  aria-x doctor gateway",
             "  aria-x doctor browser",
+            "  aria-x doctor mcp",
             "  aria-x inspect context [session_id] [agent_id]",
             "  aria-x inspect provider-payloads [session_id] [agent_id]",
             "  aria-x inspect provider-payload [session_id] [agent_id]",
@@ -169,11 +184,12 @@ fn render_cli_help(topic: Option<&str>) -> String {
             "  aria-x --explain-context <session_id> [agent_id]",
             "  aria-x --explain-provider-payloads <session_id> [agent_id]",
             "  aria-x setup stt --local",
+            "  aria-x setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>]",
             "  aria-x channels <list|status|add|remove> [channel]",
             "  aria-x help [topic]",
             "",
             "Common topics:",
-            "  run, tui, install, completion, doctor, channels, inspect, explain",
+            "  run, tui, install, completion, doctor, setup, channels, inspect, explain",
         ]
         .join("\n"),
     }
@@ -302,7 +318,14 @@ fn seed_default_runtime_config(overwrite: bool) -> Result<String, String> {
 }
 
 fn seed_default_runtime_config_at(target: &Path, overwrite: bool) -> Result<String, String> {
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.toml");
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let example_source = manifest_dir.join("config.example.toml");
+    let canonical_source = manifest_dir.join("config.toml");
+    let source = if example_source.is_file() {
+        example_source
+    } else {
+        canonical_source
+    };
     let target_dir = target
         .parent()
         .ok_or_else(|| format!("config target '{}' has no parent directory", target.display()))?;
@@ -340,7 +363,7 @@ fn render_shell_completion(shell: &str) -> Result<String, String> {
     local cur prev words cword
     _init_completion || return
     local commands="run tui status stop install completion doctor setup channels inspect explain help"
-    local doctor_topics="stt env gateway browser"
+    local doctor_topics="stt env gateway browser mcp"
     local completion_shells="bash zsh fish"
     local channel_subcommands="list status add remove"
     case "${words[1]}" in
@@ -389,7 +412,7 @@ _aria_x() {
   fi
   case "$words[2]" in
     doctor)
-      _values 'doctor topic' stt env gateway browser
+      _values 'doctor topic' stt env gateway browser mcp
       ;;
     inspect|explain)
       _values 'inspection topic' context provider-payloads provider-payload
@@ -409,7 +432,7 @@ _aria_x
         "fish" => Ok(
             r#"complete -c aria-x -f
 complete -c aria-x -n '__fish_use_subcommand' -a 'run tui status stop install completion doctor setup channels inspect explain help'
-complete -c aria-x -n '__fish_seen_subcommand_from doctor' -a 'stt env gateway browser'
+complete -c aria-x -n '__fish_seen_subcommand_from doctor' -a 'stt env gateway browser mcp'
 complete -c aria-x -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
 complete -c aria-x -n '__fish_seen_subcommand_from channels' -a 'list status add remove'
 complete -c aria-x -n '__fish_seen_subcommand_from inspect explain' -a 'context provider-payloads provider-payload'
@@ -1033,6 +1056,16 @@ async fn actual_main() {
     for tool_name in [
         "register_external_compat_tool",
         "register_remote_tool",
+        "register_mcp_server",
+        "sync_mcp_server_catalog",
+        "setup_chrome_devtools_mcp",
+        "import_mcp_tool",
+        "import_mcp_prompt",
+        "import_mcp_resource",
+        "bind_mcp_import",
+        "invoke_mcp_tool",
+        "render_mcp_prompt",
+        "read_mcp_resource",
         "browser_profile_create",
         "browser_profile_list",
         "browser_profile_use",
@@ -2751,6 +2784,17 @@ fn run_stt_management_command(
         (Some("doctor"), Some("env")) => Some(Ok(render_env_doctor(config))),
         (Some("doctor"), Some("gateway")) => Some(Ok(render_gateway_doctor(config))),
         (Some("doctor"), Some("browser")) => Some(Ok(render_browser_doctor(config))),
+        (Some("doctor"), Some("mcp")) => {
+            let live = args.iter().any(|arg| arg == "--live" || arg == "live");
+            let live_mode = args
+                .windows(2)
+                .find_map(|window| (window[0] == "--mode").then(|| window[1].clone()));
+            Some(Ok(render_mcp_doctor(
+                config,
+                live,
+                live_mode.as_deref(),
+            )))
+        }
         (Some("setup"), Some("stt")) => {
             let wants_local = args.iter().any(|arg| arg == "--local" || arg == "local");
             Some(if wants_local {
@@ -2758,6 +2802,9 @@ fn run_stt_management_command(
             } else {
                 Err("Usage: aria-x setup stt --local".into())
             })
+        }
+        (Some("setup"), Some("chrome-devtools-mcp")) => {
+            Some(setup_chrome_devtools_mcp_cli(config, args))
         }
         _ => None,
     }
@@ -2923,6 +2970,164 @@ fn render_browser_doctor(config: &ResolvedAppConfig) -> String {
     )
 }
 
+fn render_mcp_doctor(config: &ResolvedAppConfig, live: bool, live_mode: Option<&str>) -> String {
+    #[cfg(feature = "mcp-runtime")]
+    {
+        let npx_bin = resolve_executable_path("npx")
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<unavailable>".into());
+        let chrome_bin = config
+            .runtime
+            .browser_chrome_bin
+            .clone()
+            .or_else(|| {
+                let candidate = std::path::PathBuf::from(
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                );
+                candidate.is_file().then(|| candidate.display().to_string())
+            })
+            .unwrap_or_else(|| "<unset>".into());
+        let store = RuntimeStore::for_sessions_dir(Path::new(&config.ssmu.sessions_dir));
+        let servers = store.list_mcp_servers().unwrap_or_default();
+        let chrome_server = servers.iter().find(|server| server.server_id == "chrome_devtools");
+        let tool_count = store
+            .list_mcp_imported_tools("chrome_devtools")
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let prompt_count = store
+            .list_mcp_imported_prompts("chrome_devtools")
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let resource_count = store
+            .list_mcp_imported_resources("chrome_devtools")
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let developer_bindings = store
+            .list_mcp_bindings_for_agent("developer")
+            .map(|bindings| {
+                bindings
+                    .into_iter()
+                    .filter(|binding| binding.server_id == "chrome_devtools")
+                    .count()
+            })
+            .unwrap_or(0);
+
+        let mut text = format!(
+            "MCP doctor\n\
+             feature_enabled: true\n\
+             npx_bin: {}\n\
+             chrome_bin: {}\n\
+             registered_servers: {}\n\
+             chrome_devtools_registered: {}\n\
+             chrome_devtools_transport: {}\n\
+             chrome_devtools_endpoint: {}\n\
+             chrome_devtools_imported_tools: {}\n\
+             chrome_devtools_imported_prompts: {}\n\
+             chrome_devtools_imported_resources: {}\n\
+             developer_agent_bindings: {}\n\
+             note: use `aria-x setup chrome-devtools-mcp` for managed launch, or `--mode auto_connect` to attach to an existing Chrome session.\n",
+            npx_bin,
+            chrome_bin,
+            servers.len(),
+            chrome_server.is_some(),
+            chrome_server
+                .map(|server| server.transport.as_str())
+                .unwrap_or("<unregistered>"),
+            chrome_server
+                .map(|server| server.endpoint.as_str())
+                .unwrap_or("<unregistered>"),
+            tool_count,
+            prompt_count,
+            resource_count,
+            developer_bindings,
+        );
+        if live {
+            text.push_str(&render_mcp_live_probe(
+                config,
+                chrome_server.cloned(),
+                live_mode,
+            ));
+        }
+        text
+    }
+    #[cfg(not(feature = "mcp-runtime"))]
+    {
+        let _ = (config, live, live_mode);
+        "MCP doctor\nfeature_enabled: false\nnote: rebuild with the `mcp-runtime` feature enabled to use Chrome DevTools MCP.\n".into()
+    }
+}
+
+#[cfg(feature = "mcp-runtime")]
+fn render_mcp_live_probe(
+    _config: &ResolvedAppConfig,
+    registered_server: Option<McpServerProfile>,
+    live_mode: Option<&str>,
+) -> String {
+    let normalized_mode = live_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("launch_managed");
+    let (profile, source) = if let Some(server) = registered_server {
+        (server, "registered_server")
+    } else {
+        (
+            McpServerProfile {
+                server_id: "chrome_devtools".into(),
+                display_name: "Chrome DevTools MCP".into(),
+                transport: "stdio".into(),
+                endpoint: bootstrap_build_chrome_devtools_mcp_endpoint(
+                    None,
+                    Some(normalized_mode),
+                    Some("stable"),
+                    None,
+                    None,
+                    None,
+                    &[],
+                ),
+                auth_ref: None,
+                enabled: true,
+            },
+            if normalized_mode.eq_ignore_ascii_case("auto_connect")
+                || normalized_mode.eq_ignore_ascii_case("attach_existing")
+            {
+                "ephemeral_auto_connect"
+            } else {
+                "ephemeral_managed_default"
+            },
+        )
+    };
+
+    let mut registry = aria_mcp::McpRegistry::new();
+    registry.register_server(profile.clone());
+    let mut client = aria_mcp::McpClient::new(registry, aria_mcp::TransportSelector::default());
+
+    match client.discover_server_catalog("chrome_devtools") {
+        Ok(catalog) => {
+            let sample_tools = catalog
+                .tools
+                .iter()
+                .take(5)
+                .map(|tool| tool.tool_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "live_probe: ok\nlive_probe_source: {}\nlive_endpoint: {}\nlive_protocol_version: {}\nlive_tool_count: {}\nlive_prompt_count: {}\nlive_resource_count: {}\nlive_sample_tools: {}\n",
+                source,
+                profile.endpoint,
+                catalog.protocol_version.as_deref().unwrap_or("<unknown>"),
+                catalog.tools.len(),
+                catalog.prompts.len(),
+                catalog.resources.len(),
+                if sample_tools.is_empty() { "<none>" } else { &sample_tools }
+            )
+        }
+        Err(err) => format!(
+            "live_probe: failed\nlive_probe_source: {}\nlive_endpoint: {}\nlive_error: {}\n",
+            source, profile.endpoint, err
+        ),
+    }
+}
+
 fn render_stt_doctor(config: &ResolvedAppConfig) -> String {
     let status = crate::stt::inspect_stt_status(config);
     let model_path = status
@@ -3016,6 +3221,317 @@ fn setup_local_stt_env(config: &ResolvedAppConfig) -> Result<String, String> {
         whisper_bin,
         ffmpeg_bin
     ))
+}
+
+#[cfg(feature = "mcp-runtime")]
+fn bootstrap_imported_tool_from_discovery(
+    server_id: &str,
+    tool: aria_mcp::McpDiscoveredTool,
+) -> McpImportedTool {
+    McpImportedTool {
+        import_id: format!("mcp-tool:{}:{}", server_id, tool.tool_name),
+        server_id: server_id.to_string(),
+        tool_name: tool.tool_name,
+        description: tool.description,
+        parameters_schema: tool.parameters_schema,
+    }
+}
+
+#[cfg(feature = "mcp-runtime")]
+fn bootstrap_imported_prompt_from_discovery(
+    server_id: &str,
+    prompt: aria_mcp::McpDiscoveredPrompt,
+) -> McpImportedPrompt {
+    McpImportedPrompt {
+        import_id: format!("mcp-prompt:{}:{}", server_id, prompt.prompt_name),
+        server_id: server_id.to_string(),
+        prompt_name: prompt.prompt_name,
+        description: prompt.description,
+        arguments_schema: prompt.arguments_schema,
+    }
+}
+
+#[cfg(feature = "mcp-runtime")]
+fn bootstrap_imported_resource_from_discovery(
+    server_id: &str,
+    resource: aria_mcp::McpDiscoveredResource,
+) -> McpImportedResource {
+    McpImportedResource {
+        import_id: format!("mcp-resource:{}:{}", server_id, resource.resource_uri),
+        server_id: server_id.to_string(),
+        resource_uri: resource.resource_uri,
+        description: resource.description,
+        mime_type: resource.mime_type,
+    }
+}
+
+#[cfg(feature = "mcp-runtime")]
+fn bootstrap_refresh_mcp_import_cache(
+    store: &RuntimeStore,
+    server_id: &str,
+    refreshed_at_us: u64,
+) -> Result<(), String> {
+    let server = store
+        .list_mcp_servers()?
+        .into_iter()
+        .find(|server| server.server_id == server_id)
+        .ok_or_else(|| format!("unknown MCP server '{}'", server_id))?;
+    let record = McpImportCacheRecord {
+        server_id: server.server_id.clone(),
+        transport: server.transport,
+        tool_count: store.list_mcp_imported_tools(server_id)?.len() as u32,
+        prompt_count: store.list_mcp_imported_prompts(server_id)?.len() as u32,
+        resource_count: store.list_mcp_imported_resources(server_id)?.len() as u32,
+        refreshed_at_us,
+    };
+    store.upsert_mcp_import_cache_record(&record)
+}
+
+#[cfg(feature = "mcp-runtime")]
+fn bootstrap_bind_discovered_mcp_entries(
+    store: &RuntimeStore,
+    agent_id: &str,
+    server_id: &str,
+    tools: &[McpImportedTool],
+    prompts: &[McpImportedPrompt],
+    resources: &[McpImportedResource],
+    bind_prompts: bool,
+    bind_resources: bool,
+) -> Result<(usize, usize, usize), String> {
+    let now_us = chrono::Utc::now().timestamp_micros() as u64;
+    let mut bound_tools = 0usize;
+    let mut bound_prompts_count = 0usize;
+    let mut bound_resources_count = 0usize;
+    for tool in tools {
+        let binding = McpBindingRecord {
+            binding_id: format!("mcp-binding-{}", uuid::Uuid::new_v4()),
+            agent_id: agent_id.to_string(),
+            server_id: server_id.to_string(),
+            primitive_kind: McpPrimitiveKind::Tool,
+            target_name: tool.tool_name.clone(),
+            created_at_us: now_us,
+        };
+        store.upsert_mcp_binding(&binding)?;
+        bound_tools += 1;
+    }
+    if bind_prompts {
+        for prompt in prompts {
+            let binding = McpBindingRecord {
+                binding_id: format!("mcp-binding-{}", uuid::Uuid::new_v4()),
+                agent_id: agent_id.to_string(),
+                server_id: server_id.to_string(),
+                primitive_kind: McpPrimitiveKind::Prompt,
+                target_name: prompt.prompt_name.clone(),
+                created_at_us: now_us,
+            };
+            store.upsert_mcp_binding(&binding)?;
+            bound_prompts_count += 1;
+        }
+    }
+    if bind_resources {
+        for resource in resources {
+            let binding = McpBindingRecord {
+                binding_id: format!("mcp-binding-{}", uuid::Uuid::new_v4()),
+                agent_id: agent_id.to_string(),
+                server_id: server_id.to_string(),
+                primitive_kind: McpPrimitiveKind::Resource,
+                target_name: resource.resource_uri.clone(),
+                created_at_us: now_us,
+            };
+            store.upsert_mcp_binding(&binding)?;
+            bound_resources_count += 1;
+        }
+    }
+    Ok((bound_tools, bound_prompts_count, bound_resources_count))
+}
+
+#[cfg(feature = "mcp-runtime")]
+fn bootstrap_build_chrome_devtools_mcp_endpoint(
+    executable: Option<&str>,
+    mode: Option<&str>,
+    channel: Option<&str>,
+    headless: Option<bool>,
+    isolated: Option<bool>,
+    slim: Option<bool>,
+    extra_args: &[String],
+) -> String {
+    let mut parts = vec![
+        executable.unwrap_or("npx").trim().to_string(),
+        "-y".to_string(),
+        "chrome-devtools-mcp@latest".to_string(),
+    ];
+    let normalized_mode = mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("launch_managed");
+    if normalized_mode.eq_ignore_ascii_case("auto_connect")
+        || normalized_mode.eq_ignore_ascii_case("attach_existing")
+    {
+        parts.push("--autoConnect".to_string());
+    } else {
+        if headless.unwrap_or(true) {
+            parts.push("--headless".to_string());
+        }
+        if isolated.unwrap_or(true) {
+            parts.push("--isolated".to_string());
+        }
+        if slim.unwrap_or(true) {
+            parts.push("--slim".to_string());
+        }
+    }
+    if let Some(channel) = channel
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "stable")
+    {
+        parts.push(format!("--channel={}", channel));
+    }
+    for arg in extra_args {
+        let trimmed = arg.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+    parts.join(" ")
+}
+
+#[cfg(feature = "mcp-runtime")]
+fn setup_chrome_devtools_mcp_cli(config: &ResolvedAppConfig, args: &[String]) -> Result<String, String> {
+    let mut agent_id = "developer".to_string();
+    let mut mode = "launch_managed".to_string();
+    let mut channel = "stable".to_string();
+    let mut bind_prompts = false;
+    let mut bind_resources = false;
+    let mut idx = 3usize;
+    while let Some(arg) = args.get(idx) {
+        match arg.as_str() {
+            "--agent" => {
+                let value = args.get(idx + 1).ok_or_else(|| {
+                    "Usage: aria-x setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>] [--bind-prompts] [--bind-resources]".to_string()
+                })?;
+                agent_id = value.clone();
+                idx += 2;
+            }
+            "--mode" => {
+                let value = args.get(idx + 1).ok_or_else(|| {
+                    "Usage: aria-x setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>] [--bind-prompts] [--bind-resources]".to_string()
+                })?;
+                mode = value.clone();
+                idx += 2;
+            }
+            "--channel" => {
+                let value = args.get(idx + 1).ok_or_else(|| {
+                    "Usage: aria-x setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>] [--bind-prompts] [--bind-resources]".to_string()
+                })?;
+                channel = value.clone();
+                idx += 2;
+            }
+            "--bind-prompts" => {
+                bind_prompts = true;
+                idx += 1;
+            }
+            "--bind-resources" => {
+                bind_resources = true;
+                idx += 1;
+            }
+            other => {
+                return Err(format!(
+                    "Unknown argument '{}'. Usage: aria-x setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>] [--bind-prompts] [--bind-resources]",
+                    other
+                ));
+            }
+        }
+    }
+
+    let server_id = "chrome_devtools";
+    let endpoint = bootstrap_build_chrome_devtools_mcp_endpoint(
+        None,
+        Some(&mode),
+        Some(&channel),
+        None,
+        None,
+        None,
+        &[],
+    );
+    let profile = McpServerProfile {
+        server_id: server_id.to_string(),
+        display_name: "Chrome DevTools MCP".into(),
+        transport: "stdio".into(),
+        endpoint,
+        auth_ref: None,
+        enabled: true,
+    };
+    if aria_mcp::reserved_native_mcp_target(&profile.server_id)
+        || aria_mcp::reserved_native_mcp_target(&profile.display_name)
+    {
+        return Err(format!(
+            "MCP server '{}' is reserved for a native/internal subsystem boundary",
+            profile.server_id
+        ));
+    }
+
+    let now_us = chrono::Utc::now().timestamp_micros() as u64;
+    let sessions_dir = Path::new(&config.ssmu.sessions_dir);
+    let store = RuntimeStore::for_sessions_dir(sessions_dir);
+    store.upsert_mcp_server(&profile, now_us)?;
+
+    let mut registry = aria_mcp::McpRegistry::new();
+    registry.register_server(profile.clone());
+    let mut client = aria_mcp::McpClient::new(registry, aria_mcp::TransportSelector::default());
+    let catalog = client
+        .discover_server_catalog(server_id)
+        .map_err(|e| e.to_string())?;
+
+    let tools = catalog
+        .tools
+        .into_iter()
+        .map(|tool| bootstrap_imported_tool_from_discovery(server_id, tool))
+        .collect::<Vec<_>>();
+    let prompts = catalog
+        .prompts
+        .into_iter()
+        .map(|prompt| bootstrap_imported_prompt_from_discovery(server_id, prompt))
+        .collect::<Vec<_>>();
+    let resources = catalog
+        .resources
+        .into_iter()
+        .map(|resource| bootstrap_imported_resource_from_discovery(server_id, resource))
+        .collect::<Vec<_>>();
+
+    store.replace_mcp_imported_tools(server_id, &tools, now_us)?;
+    store.replace_mcp_imported_prompts(server_id, &prompts, now_us)?;
+    store.replace_mcp_imported_resources(server_id, &resources, now_us)?;
+    bootstrap_refresh_mcp_import_cache(&store, server_id, now_us)?;
+
+    let (bound_tools, bound_prompts_count, bound_resources_count) =
+        bootstrap_bind_discovered_mcp_entries(
+            &store,
+            &agent_id,
+            server_id,
+            &tools,
+            &prompts,
+            &resources,
+            bind_prompts,
+            bind_resources,
+        )?;
+
+    Ok(format!(
+        "Configured Chrome DevTools MCP for agent '{}'.\nmode: {}\nchannel: {}\nendpoint: {}\nimported_tools: {}\nimported_prompts: {}\nimported_resources: {}\nbound_tools: {}\nbound_prompts: {}\nbound_resources: {}",
+        agent_id,
+        mode,
+        channel,
+        profile.endpoint,
+        tools.len(),
+        prompts.len(),
+        resources.len(),
+        bound_tools,
+        bound_prompts_count,
+        bound_resources_count,
+    ))
+}
+
+#[cfg(not(feature = "mcp-runtime"))]
+fn setup_chrome_devtools_mcp_cli(_config: &ResolvedAppConfig, _args: &[String]) -> Result<String, String> {
+    Err("Chrome DevTools MCP setup requires the `mcp-runtime` feature.".into())
 }
 
 fn default_local_whisper_model_path() -> Result<PathBuf, String> {
@@ -3393,6 +3909,46 @@ fn register_discoverable_tool(
         "register_remote_tool" => (
             "Register a remote HTTP tool endpoint that accepts a typed JSON envelope and returns a tool result envelope.",
             r#"{"tool_name":{"type":"string"},"endpoint":{"type":"string"},"description":{"type":"string"},"parameters_schema":{"type":"string"}}"#,
+        ),
+        "register_mcp_server" => (
+            "Register an MCP server process for later import, binding, and invocation.",
+            r#"{"server_id":{"type":"string"},"display_name":{"type":"string"},"transport":{"type":"string","enum":["stdio","stdio_once"]},"endpoint":{"type":"string"},"auth_ref":{"type":"string"},"enabled":{"type":"boolean"}}"#,
+        ),
+        "sync_mcp_server_catalog" => (
+            "Connect to a registered MCP server, discover its tools/prompts/resources, persist imports, and optionally bind them to an agent.",
+            r#"{"server_id":{"type":"string"},"agent_id":{"type":"string"},"bind_tools":{"type":"boolean"},"bind_prompts":{"type":"boolean"},"bind_resources":{"type":"boolean"}}"#,
+        ),
+        "setup_chrome_devtools_mcp" => (
+            "Register and sync the Chrome DevTools MCP server so the agent can use Chrome-backed browser tools over MCP. Defaults to a managed launched Chrome session; use mode=auto_connect to attach to an already-running Chrome session.",
+            r#"{"server_id":{"type":"string"},"display_name":{"type":"string"},"endpoint_override":{"type":"string"},"executable":{"type":"string"},"mode":{"type":"string","enum":["launch_managed","auto_connect","attach_existing"]},"channel":{"type":"string","enum":["stable","beta","dev","canary"]},"headless":{"type":"boolean"},"isolated":{"type":"boolean"},"slim":{"type":"boolean"},"extra_args":{"type":"array","items":{"type":"string"}},"enabled":{"type":"boolean"},"agent_id":{"type":"string"},"bind_tools":{"type":"boolean"},"bind_prompts":{"type":"boolean"},"bind_resources":{"type":"boolean"}}"#,
+        ),
+        "import_mcp_tool" => (
+            "Persist a discovered MCP tool import manually.",
+            r#"{"import_id":{"type":"string"},"server_id":{"type":"string"},"tool_name":{"type":"string"},"description":{"type":"string"},"parameters_schema":{"type":"string"}}"#,
+        ),
+        "import_mcp_prompt" => (
+            "Persist a discovered MCP prompt import manually.",
+            r#"{"import_id":{"type":"string"},"server_id":{"type":"string"},"prompt_name":{"type":"string"},"description":{"type":"string"},"arguments_schema":{"type":"string"}}"#,
+        ),
+        "import_mcp_resource" => (
+            "Persist a discovered MCP resource import manually.",
+            r#"{"import_id":{"type":"string"},"server_id":{"type":"string"},"resource_uri":{"type":"string"},"description":{"type":"string"},"mime_type":{"type":"string"}}"#,
+        ),
+        "bind_mcp_import" => (
+            "Bind an imported MCP tool, prompt, or resource to an agent so it becomes visible and usable.",
+            r#"{"server_id":{"type":"string"},"primitive_kind":{"type":"string","enum":["tool","prompt","resource"]},"target_name":{"type":"string"},"agent_id":{"type":"string"}}"#,
+        ),
+        "invoke_mcp_tool" => (
+            "Invoke a bound imported MCP tool for the current agent.",
+            r#"{"server_id":{"type":"string"},"tool_name":{"type":"string"},"input":{"type":"object","additionalProperties":true}}"#,
+        ),
+        "render_mcp_prompt" => (
+            "Render a bound imported MCP prompt for the current agent.",
+            r#"{"server_id":{"type":"string"},"prompt_name":{"type":"string"},"arguments":{"type":"object","additionalProperties":true}}"#,
+        ),
+        "read_mcp_resource" => (
+            "Read a bound imported MCP resource for the current agent.",
+            r#"{"server_id":{"type":"string"},"resource_uri":{"type":"string"}}"#,
         ),
         "browser_profile_create" => (
             "Create a managed browser profile for later authenticated or read-only browsing.",

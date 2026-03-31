@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" fill="none">
+  <title>HiveClaw Social Preview</title>
+  <defs>
+    <linearGradient id="bg" x1="96" y1="80" x2="1164" y2="560" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="0.58" stop-color="#11161d"/>
+      <stop offset="1" stop-color="#1a2028"/>
+    </linearGradient>
+    <radialGradient id="glowLeft" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse"
+      gradientTransform="translate(228 168) rotate(24) scale(260 220)">
+      <stop offset="0" stop-color="#34d3ff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#34d3ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowRight" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse"
+      gradientTransform="translate(1018 436) rotate(-18) scale(260 220)">
+      <stop offset="0" stop-color="#ff922e" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ff922e" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1280" height="640" rx="28" fill="url(#bg)"/>
+  <rect width="1280" height="640" rx="28" fill="url(#glowLeft)"/>
+  <rect width="1280" height="640" rx="28" fill="url(#glowRight)"/>
+  <rect x="92" y="94" width="8" height="312" rx="4" fill="#ff922e"/>
+
+  <text x="124" y="176" fill="#ffffff" font-family="Arial, Helvetica, sans-serif" font-size="76" font-weight="700">
+    HiveClaw
+  </text>
+  <text x="124" y="236" fill="#d0d7de" font-family="Arial, Helvetica, sans-serif" font-size="30">
+    Local-first multi-agent runtime, gateway, and hive-mind control plane
+  </text>
+  <text x="124" y="292" fill="#8b949e" font-family="Arial, Helvetica, sans-serif" font-size="24">
+    Rust • Policy-gated • SQLite-first • MCP • Robotics-ready
+  </text>
+  <text x="124" y="334" fill="#8b949e" font-family="Arial, Helvetica, sans-serif" font-size="24">
+    Hive-minded systems for tools, channels, browsers, jobs, and future robots
+  </text>
+
+  <g transform="translate(842 104)">
+    <rect x="0" y="0" width="348" height="348" rx="34" fill="#161b22" fill-opacity="0.86" stroke="#30363d" stroke-width="2"/>
+    <image href="../HiveClawFavicon.png" x="26" y="26" width="296" height="296" preserveAspectRatio="xMidYMid meet"/>
+  </g>
+
+  <g opacity="0.92">
+    <text x="124" y="486" fill="#ffffff" font-family="Arial, Helvetica, sans-serif" font-size="26" font-weight="700">
+      Not a chat wrapper.
+    </text>
+    <text x="124" y="524" fill="#d0d7de" font-family="Arial, Helvetica, sans-serif" font-size="24">
+      Durable state, explicit policy boundaries, operator visibility, and swarm-capable architecture.
+    </text>
+  </g>
+</svg>

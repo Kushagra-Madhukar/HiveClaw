@@ -115,8 +115,6 @@ backend = "none"           # "gazebo" | "mujoco" | "none"
 # enabled=true, log_level=debug for all logs. Or RUST_LOG=aria_x=debug
 enabled = false
 log_level = "info"
-enabled = false
-log_level = "info"
 
 [ui]
 enabled = false

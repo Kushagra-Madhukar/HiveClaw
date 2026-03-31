@@ -241,6 +241,55 @@ struct RegisterRemoteToolRequest {
 
 #[cfg(feature = "mcp-runtime")]
 #[derive(Debug, Clone, serde::Deserialize)]
+struct SyncMcpServerCatalogRequest {
+    server_id: String,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    bind_tools: Option<bool>,
+    #[serde(default)]
+    bind_prompts: Option<bool>,
+    #[serde(default)]
+    bind_resources: Option<bool>,
+}
+
+#[cfg(feature = "mcp-runtime")]
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SetupChromeDevtoolsMcpRequest {
+    #[serde(default)]
+    server_id: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    endpoint_override: Option<String>,
+    #[serde(default)]
+    executable: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    headless: Option<bool>,
+    #[serde(default)]
+    isolated: Option<bool>,
+    #[serde(default)]
+    slim: Option<bool>,
+    #[serde(default)]
+    extra_args: Option<Vec<String>>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    bind_tools: Option<bool>,
+    #[serde(default)]
+    bind_prompts: Option<bool>,
+    #[serde(default)]
+    bind_resources: Option<bool>,
+}
+
+#[cfg(feature = "mcp-runtime")]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct BindMcpImportRequest {
     server_id: String,
     primitive_kind: String,
@@ -2314,6 +2363,8 @@ impl ToolExecutor for NativeToolExecutor {
                 RuntimeStore::for_sessions_dir(&sessions_dir)
                     .upsert_mcp_server(&profile, now_us)
                     .map_err(OrchestratorError::ToolError)?;
+                invalidate_pooled_mcp_client(&RuntimeStore::for_sessions_dir(&sessions_dir))
+                    .map_err(OrchestratorError::ToolError)?;
                 Ok(ToolExecutionResult::structured(
                     format!("Registered MCP server '{}'.", profile.server_id),
                     "mcp_server",
@@ -2321,6 +2372,216 @@ impl ToolExecutor for NativeToolExecutor {
                         "server_id": profile.server_id,
                         "transport": profile.transport,
                         "enabled": profile.enabled,
+                    }),
+                ))
+            }
+            #[cfg(feature = "mcp-runtime")]
+            "sync_mcp_server_catalog" => {
+                let request: SyncMcpServerCatalogRequest = decode_tool_args(call)?;
+                let sessions_dir = self.sessions_dir.as_ref().ok_or_else(|| {
+                    OrchestratorError::ToolError(
+                        "sync_mcp_server_catalog requires runtime persistence (sessions_dir)".into(),
+                    )
+                })?;
+                let store = RuntimeStore::for_sessions_dir(&sessions_dir);
+                ensure_mcp_server_exists(&store, &request.server_id)?;
+                let catalog = discover_mcp_server_catalog(&store, &request.server_id).await?;
+                let tools = catalog
+                    .tools
+                    .into_iter()
+                    .map(|tool| imported_tool_from_discovery(&request.server_id, tool))
+                    .collect::<Vec<_>>();
+                let prompts = catalog
+                    .prompts
+                    .into_iter()
+                    .map(|prompt| imported_prompt_from_discovery(&request.server_id, prompt))
+                    .collect::<Vec<_>>();
+                let resources = catalog
+                    .resources
+                    .into_iter()
+                    .map(|resource| imported_resource_from_discovery(&request.server_id, resource))
+                    .collect::<Vec<_>>();
+                let now_us = chrono::Utc::now().timestamp_micros() as u64;
+                store
+                    .replace_mcp_imported_tools(&request.server_id, &tools, now_us)
+                    .map_err(OrchestratorError::ToolError)?;
+                store
+                    .replace_mcp_imported_prompts(&request.server_id, &prompts, now_us)
+                    .map_err(OrchestratorError::ToolError)?;
+                store
+                    .replace_mcp_imported_resources(&request.server_id, &resources, now_us)
+                    .map_err(OrchestratorError::ToolError)?;
+                refresh_mcp_import_cache(&store, &request.server_id, now_us)
+                    .map_err(OrchestratorError::ToolError)?;
+                invalidate_pooled_mcp_client(&store).map_err(OrchestratorError::ToolError)?;
+                let agent_id = request
+                    .agent_id
+                    .clone()
+                    .or_else(|| self.invoking_agent_id.clone());
+                let bind_tools = request.bind_tools.unwrap_or(false);
+                let bind_prompts = request.bind_prompts.unwrap_or(false);
+                let bind_resources = request.bind_resources.unwrap_or(false);
+                let (bound_tool_count, bound_prompt_count, bound_resource_count) =
+                    if let Some(agent_id) = agent_id.as_deref() {
+                        bind_discovered_mcp_entries(
+                            &store,
+                            agent_id,
+                            &request.server_id,
+                            &tools,
+                            &prompts,
+                            &resources,
+                            bind_tools,
+                            bind_prompts,
+                            bind_resources,
+                        )
+                        .map_err(OrchestratorError::ToolError)?
+                    } else {
+                        (0, 0, 0)
+                    };
+                Ok(ToolExecutionResult::structured(
+                    format!(
+                        "Synced MCP catalog for '{}' ({} tools, {} prompts, {} resources).",
+                        request.server_id,
+                        tools.len(),
+                        prompts.len(),
+                        resources.len()
+                    ),
+                    "mcp_catalog_sync",
+                    serde_json::json!({
+                        "server_id": request.server_id,
+                        "tool_count": tools.len(),
+                        "prompt_count": prompts.len(),
+                        "resource_count": resources.len(),
+                        "bound_tool_count": bound_tool_count,
+                        "bound_prompt_count": bound_prompt_count,
+                        "bound_resource_count": bound_resource_count,
+                    }),
+                ))
+            }
+            #[cfg(feature = "mcp-runtime")]
+            "setup_chrome_devtools_mcp" => {
+                let request: SetupChromeDevtoolsMcpRequest = decode_tool_args(call)?;
+                let sessions_dir = self.sessions_dir.as_ref().ok_or_else(|| {
+                    OrchestratorError::ToolError(
+                        "setup_chrome_devtools_mcp requires runtime persistence (sessions_dir)".into(),
+                    )
+                })?;
+                let store = RuntimeStore::for_sessions_dir(&sessions_dir);
+                let server_id = request
+                    .server_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("chrome_devtools")
+                    .to_string();
+                let display_name = request
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| "Chrome DevTools MCP".to_string());
+                let endpoint = build_chrome_devtools_mcp_endpoint(
+                    request.executable.as_deref(),
+                    request.mode.as_deref(),
+                    request.channel.as_deref(),
+                    request.headless,
+                    request.isolated,
+                    request.slim,
+                    request.extra_args.as_deref().unwrap_or(&[]),
+                );
+                let endpoint = request
+                    .endpoint_override
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(endpoint);
+                let profile = McpServerProfile {
+                    server_id: server_id.clone(),
+                    display_name,
+                    transport: "stdio".into(),
+                    endpoint,
+                    auth_ref: None,
+                    enabled: request.enabled.unwrap_or(true),
+                };
+                if aria_mcp::reserved_native_mcp_target(&profile.server_id)
+                    || aria_mcp::reserved_native_mcp_target(&profile.display_name)
+                {
+                    return Err(OrchestratorError::ToolError(format!(
+                        "MCP server '{}' is reserved for a native/internal subsystem boundary",
+                        profile.server_id
+                    )));
+                }
+                let now_us = chrono::Utc::now().timestamp_micros() as u64;
+                store
+                    .upsert_mcp_server(&profile, now_us)
+                    .map_err(OrchestratorError::ToolError)?;
+                invalidate_pooled_mcp_client(&store).map_err(OrchestratorError::ToolError)?;
+                let sync_request = SyncMcpServerCatalogRequest {
+                    server_id: server_id.clone(),
+                    agent_id: request.agent_id.clone().or_else(|| self.invoking_agent_id.clone()),
+                    bind_tools: Some(request.bind_tools.unwrap_or(true)),
+                    bind_prompts: Some(request.bind_prompts.unwrap_or(false)),
+                    bind_resources: Some(request.bind_resources.unwrap_or(false)),
+                };
+                let catalog = discover_mcp_server_catalog(&store, &server_id).await?;
+                let tools = catalog
+                    .tools
+                    .into_iter()
+                    .map(|tool| imported_tool_from_discovery(&server_id, tool))
+                    .collect::<Vec<_>>();
+                let prompts = catalog
+                    .prompts
+                    .into_iter()
+                    .map(|prompt| imported_prompt_from_discovery(&server_id, prompt))
+                    .collect::<Vec<_>>();
+                let resources = catalog
+                    .resources
+                    .into_iter()
+                    .map(|resource| imported_resource_from_discovery(&server_id, resource))
+                    .collect::<Vec<_>>();
+                store
+                    .replace_mcp_imported_tools(&server_id, &tools, now_us)
+                    .map_err(OrchestratorError::ToolError)?;
+                store
+                    .replace_mcp_imported_prompts(&server_id, &prompts, now_us)
+                    .map_err(OrchestratorError::ToolError)?;
+                store
+                    .replace_mcp_imported_resources(&server_id, &resources, now_us)
+                    .map_err(OrchestratorError::ToolError)?;
+                refresh_mcp_import_cache(&store, &server_id, now_us)
+                    .map_err(OrchestratorError::ToolError)?;
+                invalidate_pooled_mcp_client(&store).map_err(OrchestratorError::ToolError)?;
+                let (bound_tool_count, bound_prompt_count, bound_resource_count) =
+                    if let Some(agent_id) = sync_request.agent_id.as_deref() {
+                        bind_discovered_mcp_entries(
+                            &store,
+                            agent_id,
+                            &server_id,
+                            &tools,
+                            &prompts,
+                            &resources,
+                            sync_request.bind_tools.unwrap_or(true),
+                            sync_request.bind_prompts.unwrap_or(false),
+                            sync_request.bind_resources.unwrap_or(false),
+                        )
+                        .map_err(OrchestratorError::ToolError)?
+                    } else {
+                        (0, 0, 0)
+                    };
+                Ok(ToolExecutionResult::structured(
+                    format!(
+                        "Configured Chrome DevTools MCP '{}' and synced {} tools.",
+                        server_id,
+                        tools.len()
+                    ),
+                    "mcp_server",
+                    serde_json::json!({
+                        "server_id": server_id,
+                        "transport": "stdio",
+                        "endpoint": profile.endpoint,
+                        "tool_count": tools.len(),
+                        "prompt_count": prompts.len(),
+                        "resource_count": resources.len(),
+                        "bound_tool_count": bound_tool_count,
+                        "bound_prompt_count": bound_prompt_count,
+                        "bound_resource_count": bound_resource_count,
                     }),
                 ))
             }
@@ -2340,6 +2601,7 @@ impl ToolExecutor for NativeToolExecutor {
                     .map_err(OrchestratorError::ToolError)?;
                 refresh_mcp_import_cache(&store, &tool.server_id, now_us)
                     .map_err(OrchestratorError::ToolError)?;
+                invalidate_pooled_mcp_client(&store).map_err(OrchestratorError::ToolError)?;
                 Ok(ToolExecutionResult::structured(
                     format!(
                         "Imported MCP tool '{}' from server '{}'.",
@@ -2368,6 +2630,7 @@ impl ToolExecutor for NativeToolExecutor {
                     .map_err(OrchestratorError::ToolError)?;
                 refresh_mcp_import_cache(&store, &prompt.server_id, now_us)
                     .map_err(OrchestratorError::ToolError)?;
+                invalidate_pooled_mcp_client(&store).map_err(OrchestratorError::ToolError)?;
                 Ok(ToolExecutionResult::structured(
                     format!(
                         "Imported MCP prompt '{}' from server '{}'.",
@@ -2396,6 +2659,7 @@ impl ToolExecutor for NativeToolExecutor {
                     .map_err(OrchestratorError::ToolError)?;
                 refresh_mcp_import_cache(&store, &resource.server_id, now_us)
                     .map_err(OrchestratorError::ToolError)?;
+                invalidate_pooled_mcp_client(&store).map_err(OrchestratorError::ToolError)?;
                 Ok(ToolExecutionResult::structured(
                     format!(
                         "Imported MCP resource '{}' from server '{}'.",
@@ -3069,6 +3333,8 @@ impl ToolExecutor for NativeToolExecutor {
             }
             #[cfg(not(feature = "mcp-runtime"))]
             "register_mcp_server"
+            | "sync_mcp_server_catalog"
+            | "setup_chrome_devtools_mcp"
             | "import_mcp_tool"
             | "import_mcp_prompt"
             | "import_mcp_resource"
@@ -5426,6 +5692,8 @@ impl ToolExecutor for MultiplexToolExecutor {
             | "register_external_compat_tool"
             | "register_remote_tool"
             | "register_mcp_server"
+            | "sync_mcp_server_catalog"
+            | "setup_chrome_devtools_mcp"
             | "import_mcp_tool"
             | "import_mcp_prompt"
             | "import_mcp_resource"
@@ -7249,6 +7517,16 @@ fn pooled_mcp_client(
 }
 
 #[cfg(feature = "mcp-runtime")]
+fn invalidate_pooled_mcp_client(store: &RuntimeStore) -> Result<(), String> {
+    let key = store.cache_key();
+    let mut pool = mcp_client_pool()
+        .lock()
+        .map_err(|_| "mcp client pool poisoned".to_string())?;
+    pool.remove(&key);
+    Ok(())
+}
+
+#[cfg(feature = "mcp-runtime")]
 fn parse_mcp_primitive_kind(value: &str) -> Result<McpPrimitiveKind, OrchestratorError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "tool" => Ok(McpPrimitiveKind::Tool),
@@ -7332,6 +7610,170 @@ fn refresh_mcp_import_cache(
         refreshed_at_us,
     };
     store.upsert_mcp_import_cache_record(&record)
+}
+
+#[cfg(feature = "mcp-runtime")]
+async fn discover_mcp_server_catalog(
+    store: &RuntimeStore,
+    server_id: &str,
+) -> Result<aria_mcp::McpServerCatalog, OrchestratorError> {
+    let client = pooled_mcp_client(store).map_err(OrchestratorError::ToolError)?;
+    let mut client = client.lock().await;
+    client
+        .discover_server_catalog(server_id)
+        .map_err(|e| OrchestratorError::ToolError(e.to_string()))
+}
+
+#[cfg(feature = "mcp-runtime")]
+fn imported_tool_from_discovery(
+    server_id: &str,
+    tool: aria_mcp::McpDiscoveredTool,
+) -> McpImportedTool {
+    McpImportedTool {
+        import_id: format!("mcp-tool:{}:{}", server_id, tool.tool_name),
+        server_id: server_id.to_string(),
+        tool_name: tool.tool_name,
+        description: tool.description,
+        parameters_schema: tool.parameters_schema,
+    }
+}
+
+#[cfg(feature = "mcp-runtime")]
+fn imported_prompt_from_discovery(
+    server_id: &str,
+    prompt: aria_mcp::McpDiscoveredPrompt,
+) -> McpImportedPrompt {
+    McpImportedPrompt {
+        import_id: format!("mcp-prompt:{}:{}", server_id, prompt.prompt_name),
+        server_id: server_id.to_string(),
+        prompt_name: prompt.prompt_name,
+        description: prompt.description,
+        arguments_schema: prompt.arguments_schema,
+    }
+}
+
+#[cfg(feature = "mcp-runtime")]
+fn imported_resource_from_discovery(
+    server_id: &str,
+    resource: aria_mcp::McpDiscoveredResource,
+) -> McpImportedResource {
+    McpImportedResource {
+        import_id: format!("mcp-resource:{}:{}", server_id, resource.resource_uri),
+        server_id: server_id.to_string(),
+        resource_uri: resource.resource_uri,
+        description: resource.description,
+        mime_type: resource.mime_type,
+    }
+}
+
+#[cfg(feature = "mcp-runtime")]
+fn bind_discovered_mcp_entries(
+    store: &RuntimeStore,
+    agent_id: &str,
+    server_id: &str,
+    tools: &[McpImportedTool],
+    prompts: &[McpImportedPrompt],
+    resources: &[McpImportedResource],
+    bind_tools: bool,
+    bind_prompts: bool,
+    bind_resources: bool,
+) -> Result<(usize, usize, usize), String> {
+    let now_us = chrono::Utc::now().timestamp_micros() as u64;
+    let mut bound_tools = 0usize;
+    let mut bound_prompts = 0usize;
+    let mut bound_resources = 0usize;
+    if bind_tools {
+        for tool in tools {
+            let binding = McpBindingRecord {
+                binding_id: format!("mcp-binding-{}", uuid::Uuid::new_v4()),
+                agent_id: agent_id.to_string(),
+                server_id: server_id.to_string(),
+                primitive_kind: McpPrimitiveKind::Tool,
+                target_name: tool.tool_name.clone(),
+                created_at_us: now_us,
+            };
+            store.upsert_mcp_binding(&binding)?;
+            bound_tools += 1;
+        }
+    }
+    if bind_prompts {
+        for prompt in prompts {
+            let binding = McpBindingRecord {
+                binding_id: format!("mcp-binding-{}", uuid::Uuid::new_v4()),
+                agent_id: agent_id.to_string(),
+                server_id: server_id.to_string(),
+                primitive_kind: McpPrimitiveKind::Prompt,
+                target_name: prompt.prompt_name.clone(),
+                created_at_us: now_us,
+            };
+            store.upsert_mcp_binding(&binding)?;
+            bound_prompts += 1;
+        }
+    }
+    if bind_resources {
+        for resource in resources {
+            let binding = McpBindingRecord {
+                binding_id: format!("mcp-binding-{}", uuid::Uuid::new_v4()),
+                agent_id: agent_id.to_string(),
+                server_id: server_id.to_string(),
+                primitive_kind: McpPrimitiveKind::Resource,
+                target_name: resource.resource_uri.clone(),
+                created_at_us: now_us,
+            };
+            store.upsert_mcp_binding(&binding)?;
+            bound_resources += 1;
+        }
+    }
+    Ok((bound_tools, bound_prompts, bound_resources))
+}
+
+#[cfg(feature = "mcp-runtime")]
+fn build_chrome_devtools_mcp_endpoint(
+    executable: Option<&str>,
+    mode: Option<&str>,
+    channel: Option<&str>,
+    headless: Option<bool>,
+    isolated: Option<bool>,
+    slim: Option<bool>,
+    extra_args: &[String],
+) -> String {
+    let mut parts = vec![
+        executable.unwrap_or("npx").trim().to_string(),
+        "-y".to_string(),
+        "chrome-devtools-mcp@latest".to_string(),
+    ];
+    let normalized_mode = mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("launch_managed");
+    if normalized_mode.eq_ignore_ascii_case("auto_connect")
+        || normalized_mode.eq_ignore_ascii_case("attach_existing")
+    {
+        parts.push("--autoConnect".to_string());
+    } else {
+        if headless.unwrap_or(true) {
+            parts.push("--headless".to_string());
+        }
+        if isolated.unwrap_or(true) {
+            parts.push("--isolated".to_string());
+        }
+        if slim.unwrap_or(true) {
+            parts.push("--slim".to_string());
+        }
+    }
+    if let Some(channel) = channel
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "stable")
+    {
+        parts.push(format!("--channel={}", channel));
+    }
+    for arg in extra_args {
+        let trimmed = arg.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+    parts.join(" ")
 }
 
 #[cfg(feature = "mcp-runtime")]
@@ -12042,6 +12484,7 @@ fn contextual_runtime_tool_names_for_request(
         "mcp server",
         "register mcp",
         "import mcp",
+        "sync mcp",
         "bind mcp",
         "mcp import",
         "invoke mcp",
@@ -12050,12 +12493,16 @@ fn contextual_runtime_tool_names_for_request(
         "mcp resource",
         "render mcp",
         "read mcp resource",
+        "chrome devtools mcp",
+        "devtools mcp",
     ]
     .iter()
     .any(|needle| lower.contains(needle));
     if mcp_request && matches!(agent_id, "omni" | "developer") {
         tools.extend([
             "register_mcp_server",
+            "sync_mcp_server_catalog",
+            "setup_chrome_devtools_mcp",
             "import_mcp_tool",
             "import_mcp_prompt",
             "import_mcp_resource",
@@ -12141,6 +12588,7 @@ fn request_is_mcp_operation_like(request_text: &str) -> bool {
         "mcp server",
         "register mcp",
         "import mcp",
+        "sync mcp",
         "bind mcp",
         "mcp import",
         "invoke mcp",
@@ -12149,6 +12597,8 @@ fn request_is_mcp_operation_like(request_text: &str) -> bool {
         "mcp resource",
         "render mcp",
         "read mcp resource",
+        "chrome devtools mcp",
+        "devtools mcp",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -12888,6 +13338,29 @@ fn heuristic_mcp_tool_call(request_text: &str) -> Option<ToolCall> {
     let lower = request_text.to_ascii_lowercase();
     let mut arguments = serde_json::Map::new();
 
+    if lower.contains("chrome devtools mcp") || lower.contains("devtools mcp") {
+        if lower.contains("auto connect")
+            || lower.contains("autoconnect")
+            || lower.contains("attach to existing")
+            || lower.contains("existing chrome")
+        {
+            arguments.insert(
+                "mode".into(),
+                serde_json::Value::String("auto_connect".into()),
+            );
+        }
+        let channel = extract_named_value(request_text, "channel")
+            .or_else(|| extract_after_phrase(request_text, "channel "));
+        if let Some(channel) = channel {
+            arguments.insert("channel".into(), serde_json::Value::String(channel));
+        }
+        return Some(ToolCall {
+            invocation_id: None,
+            name: "setup_chrome_devtools_mcp".into(),
+            arguments: serde_json::Value::Object(arguments).to_string(),
+});
+    }
+
     if lower.contains("register") && lower.contains("mcp server") {
         arguments.insert(
             "server_id".into(),
@@ -12912,6 +13385,17 @@ fn heuristic_mcp_tool_call(request_text: &str) -> Option<ToolCall> {
         return Some(ToolCall {
             invocation_id: None,
             name: "register_mcp_server".into(),
+            arguments: serde_json::Value::Object(arguments).to_string(),
+});
+    }
+
+    if lower.contains("sync") && lower.contains("mcp") {
+        let server_id = extract_named_value(request_text, "server_id")
+            .or_else(|| extract_after_phrase(request_text, "server "))?;
+        arguments.insert("server_id".into(), serde_json::Value::String(server_id));
+        return Some(ToolCall {
+            invocation_id: None,
+            name: "sync_mcp_server_catalog".into(),
             arguments: serde_json::Value::Object(arguments).to_string(),
 });
     }
@@ -13729,7 +14213,14 @@ fn execution_artifact_kind_for_tool(tool_name: &str) -> Option<aria_core::Execut
     if tool_name.starts_with("browser_") || tool_name.starts_with("crawl_") || tool_name.starts_with("watch_") {
         return Some(aria_core::ExecutionArtifactKind::Browser);
     }
-    if matches!(tool_name, "invoke_mcp_tool" | "render_mcp_prompt" | "read_mcp_resource") {
+    if matches!(
+        tool_name,
+        "invoke_mcp_tool"
+            | "render_mcp_prompt"
+            | "read_mcp_resource"
+            | "sync_mcp_server_catalog"
+            | "setup_chrome_devtools_mcp"
+    ) {
         return Some(aria_core::ExecutionArtifactKind::Mcp);
     }
     if tool_name == "spawn_agent" {
@@ -13880,7 +14371,13 @@ fn required_runtime_tool_names_for_contract(
         }
         aria_core::ExecutionContractKind::BrowserAct => &["browser_act"],
         aria_core::ExecutionContractKind::McpInvoke => {
-            &["invoke_mcp_tool", "render_mcp_prompt", "read_mcp_resource"]
+            &[
+                "setup_chrome_devtools_mcp",
+                "sync_mcp_server_catalog",
+                "invoke_mcp_tool",
+                "render_mcp_prompt",
+                "read_mcp_resource",
+            ]
         }
         aria_core::ExecutionContractKind::SubAgentSpawn => &["spawn_agent"],
         _ => &[],
@@ -15616,5 +16113,34 @@ mod phase8_tests {
         assert!(ctx.contains("hello_joker.js"));
         assert!(ctx.contains("hello.js"));
         assert!(ctx.contains("recent_artifacts"));
+    }
+
+    #[cfg(feature = "mcp-runtime")]
+    #[test]
+    fn chrome_devtools_endpoint_defaults_to_managed_launch_mode() {
+        let endpoint =
+            build_chrome_devtools_mcp_endpoint(None, None, None, None, None, None, &[]);
+        assert_eq!(
+            endpoint,
+            "npx -y chrome-devtools-mcp@latest --headless --isolated --slim"
+        );
+    }
+
+    #[cfg(feature = "mcp-runtime")]
+    #[test]
+    fn chrome_devtools_endpoint_supports_auto_connect_mode() {
+        let endpoint = build_chrome_devtools_mcp_endpoint(
+            None,
+            Some("auto_connect"),
+            Some("beta"),
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert_eq!(
+            endpoint,
+            "npx -y chrome-devtools-mcp@latest --autoConnect --channel=beta"
+        );
     }
 }

@@ -74,6 +74,41 @@ pub struct McpResourceReadResult {
     pub payload: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpDiscoveredTool {
+    pub tool_name: String,
+    pub description: String,
+    pub parameters_schema: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpDiscoveredPrompt {
+    pub prompt_name: String,
+    pub description: String,
+    #[serde(default)]
+    pub arguments_schema: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpDiscoveredResource {
+    pub resource_uri: String,
+    pub description: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerCatalog {
+    pub server_id: String,
+    #[serde(default)]
+    pub protocol_version: Option<String>,
+    #[serde(default)]
+    pub capabilities_json: Option<String>,
+    pub tools: Vec<McpDiscoveredTool>,
+    pub prompts: Vec<McpDiscoveredPrompt>,
+    pub resources: Vec<McpDiscoveredResource>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpBoundaryKind {
@@ -166,6 +201,10 @@ fn leaf_external_targets() -> &'static [(&'static str, &'static str)] {
         (
             "docs_saas",
             "Third-party documentation/search SaaS endpoints are leaf external integrations.",
+        ),
+        (
+            "chrome_devtools",
+            "Chrome DevTools MCP is a leaf external browser-session integration and should remain separate from the app's native browser runtime boundary.",
         ),
     ]
 }
@@ -705,6 +744,42 @@ impl PersistentSubprocessStdioTransport {
             McpRegistryError::SessionError(format!("MCP {} failed without error", method))
         }))
     }
+
+    fn list_tools_json(
+        &self,
+        session: &McpSession,
+        cursor: Option<String>,
+    ) -> Result<Value, McpRegistryError> {
+        let mut params = serde_json::Map::new();
+        if let Some(cursor) = cursor {
+            params.insert("cursor".into(), Value::String(cursor));
+        }
+        self.invoke_jsonrpc(session, "tools/list", Value::Object(params))
+    }
+
+    fn list_prompts_json(
+        &self,
+        session: &McpSession,
+        cursor: Option<String>,
+    ) -> Result<Value, McpRegistryError> {
+        let mut params = serde_json::Map::new();
+        if let Some(cursor) = cursor {
+            params.insert("cursor".into(), Value::String(cursor));
+        }
+        self.invoke_jsonrpc(session, "prompts/list", Value::Object(params))
+    }
+
+    fn list_resources_json(
+        &self,
+        session: &McpSession,
+        cursor: Option<String>,
+    ) -> Result<Value, McpRegistryError> {
+        let mut params = serde_json::Map::new();
+        if let Some(cursor) = cursor {
+            params.insert("cursor".into(), Value::String(cursor));
+        }
+        self.invoke_jsonrpc(session, "resources/list", Value::Object(params))
+    }
 }
 
 impl McpTransport for PersistentSubprocessStdioTransport {
@@ -1103,6 +1178,232 @@ impl<T: McpTransport> McpClient<T> {
         });
         before.saturating_sub(self.sessions.len())
     }
+}
+
+impl McpClient<TransportSelector> {
+    fn list_tools_page(
+        &mut self,
+        server_id: &str,
+        cursor: Option<String>,
+    ) -> Result<Value, McpRegistryError> {
+        let session = self.ensure_session(server_id)?.clone();
+        if !Self::session_supports_primitive(&session, "tools") {
+            return Ok(serde_json::json!({ "tools": [] }));
+        }
+        match session.transport.as_str() {
+            "stdio" => self.transport.persistent_stdio.list_tools_json(&session, cursor),
+            other => Err(McpRegistryError::SessionError(format!(
+                "MCP transport '{}' does not support catalog discovery",
+                other
+            ))),
+        }
+    }
+
+    fn list_prompts_page(
+        &mut self,
+        server_id: &str,
+        cursor: Option<String>,
+    ) -> Result<Value, McpRegistryError> {
+        let session = self.ensure_session(server_id)?.clone();
+        if !Self::session_supports_primitive(&session, "prompts") {
+            return Ok(serde_json::json!({ "prompts": [] }));
+        }
+        match session.transport.as_str() {
+            "stdio" => self.transport.persistent_stdio.list_prompts_json(&session, cursor),
+            other => Err(McpRegistryError::SessionError(format!(
+                "MCP transport '{}' does not support catalog discovery",
+                other
+            ))),
+        }
+    }
+
+    fn list_resources_page(
+        &mut self,
+        server_id: &str,
+        cursor: Option<String>,
+    ) -> Result<Value, McpRegistryError> {
+        let session = self.ensure_session(server_id)?.clone();
+        if !Self::session_supports_primitive(&session, "resources") {
+            return Ok(serde_json::json!({ "resources": [] }));
+        }
+        match session.transport.as_str() {
+            "stdio" => self
+                .transport
+                .persistent_stdio
+                .list_resources_json(&session, cursor),
+            other => Err(McpRegistryError::SessionError(format!(
+                "MCP transport '{}' does not support catalog discovery",
+                other
+            ))),
+        }
+    }
+
+    pub fn discover_server_catalog(
+        &mut self,
+        server_id: &str,
+    ) -> Result<McpServerCatalog, McpRegistryError> {
+        let session = self.ensure_session(server_id)?.clone();
+        let tools = collect_paginated(
+            |cursor| self.list_tools_page(server_id, cursor),
+            "tools",
+            parse_discovered_tool,
+        )?;
+        let prompts = collect_paginated(
+            |cursor| self.list_prompts_page(server_id, cursor),
+            "prompts",
+            parse_discovered_prompt,
+        )?;
+        let resources = collect_paginated(
+            |cursor| self.list_resources_page(server_id, cursor),
+            "resources",
+            parse_discovered_resource,
+        )?;
+        Ok(McpServerCatalog {
+            server_id: server_id.to_string(),
+            protocol_version: session.protocol_version,
+            capabilities_json: session.capabilities_json,
+            tools,
+            prompts,
+            resources,
+        })
+    }
+}
+
+fn collect_paginated<T, F, P>(
+    mut page_fn: F,
+    key: &str,
+    parse_entry: P,
+) -> Result<Vec<T>, McpRegistryError>
+where
+    F: FnMut(Option<String>) -> Result<Value, McpRegistryError>,
+    P: Fn(&Value) -> Result<T, McpRegistryError>,
+{
+    let mut out = Vec::new();
+    let mut cursor = None;
+    let mut pages = 0usize;
+    loop {
+        pages += 1;
+        if pages > 32 {
+            return Err(McpRegistryError::SessionError(format!(
+                "MCP {} pagination exceeded 32 pages",
+                key
+            )));
+        }
+        let page = page_fn(cursor.clone())?;
+        let entries = page
+            .get(key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for entry in entries {
+            out.push(parse_entry(&entry)?);
+        }
+        let next_cursor = page
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .or_else(|| page.get("cursor").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .filter(|value| !value.trim().is_empty());
+        if next_cursor.is_none() || next_cursor == cursor {
+            break;
+        }
+        cursor = next_cursor;
+    }
+    Ok(out)
+}
+
+fn parse_discovered_tool(value: &Value) -> Result<McpDiscoveredTool, McpRegistryError> {
+    let tool_name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| McpRegistryError::SessionError("MCP tools/list entry missing name".into()))?
+        .to_string();
+    let description = value
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let parameters_schema = value
+        .get("inputSchema")
+        .or_else(|| value.get("parameters"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"type":"object","additionalProperties":true}));
+    Ok(McpDiscoveredTool {
+        tool_name,
+        description,
+        parameters_schema: serde_json::to_string(&parameters_schema).map_err(|e| {
+            McpRegistryError::SessionError(format!(
+                "serialize MCP discovered tool schema failed: {}",
+                e
+            ))
+        })?,
+    })
+}
+
+fn parse_discovered_prompt(value: &Value) -> Result<McpDiscoveredPrompt, McpRegistryError> {
+    let prompt_name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            McpRegistryError::SessionError("MCP prompts/list entry missing name".into())
+        })?
+        .to_string();
+    let description = value
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let arguments_schema = value.get("arguments").and_then(Value::as_array).map(|arguments| {
+        let properties = arguments
+            .iter()
+            .filter_map(|argument| {
+                let name = argument.get("name")?.as_str()?.to_string();
+                let mut schema = serde_json::Map::new();
+                schema.insert("type".into(), Value::String("string".into()));
+                if let Some(description) = argument.get("description").and_then(Value::as_str) {
+                    schema.insert("description".into(), Value::String(description.to_string()));
+                }
+                Some((name, Value::Object(schema)))
+            })
+            .collect::<serde_json::Map<String, Value>>();
+        serde_json::json!({
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": true
+        })
+    });
+    Ok(McpDiscoveredPrompt {
+        prompt_name,
+        description,
+        arguments_schema: arguments_schema.map(|schema| {
+            serde_json::to_string(&schema).unwrap_or_else(|_| "{}".to_string())
+        }),
+    })
+}
+
+fn parse_discovered_resource(value: &Value) -> Result<McpDiscoveredResource, McpRegistryError> {
+    let resource_uri = value
+        .get("uri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            McpRegistryError::SessionError("MCP resources/list entry missing uri".into())
+        })?
+        .to_string();
+    let description = value
+        .get("description")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("name").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    let mime_type = value
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    Ok(McpDiscoveredResource {
+        resource_uri,
+        description,
+        mime_type,
+    })
 }
 
 impl McpRegistry {
@@ -1886,11 +2187,55 @@ mod tests {
             McpBoundaryKind::LeafExternal
         );
         assert_eq!(
+            classify_mcp_boundary_target("chrome_devtools").classification,
+            McpBoundaryKind::LeafExternal
+        );
+        assert_eq!(
             classify_mcp_boundary_target("custom_vendor_x").classification,
             McpBoundaryKind::ReviewRequired
         );
         assert!(reserved_native_mcp_target("scheduler_core"));
         assert!(!reserved_native_mcp_target("linear"));
+    }
+
+    #[test]
+    fn client_discovers_server_catalog_from_stdio_transport() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script_path = temp.path().join("mcp-catalog.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  if printf '%s' \"$line\" | grep -q '\"method\":\"initialize\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-05\",\"capabilities\":{\"tools\":{},\"prompts\":{},\"resources\":{}}}}\\n'\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"notifications/initialized\"'; then\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"tools/list\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"click\",\"description\":\"Click the active element\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"selector\":{\"type\":\"string\"}},\"required\":[\"selector\"]}}]}}\\n'\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"prompts/list\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"prompts\":[{\"name\":\"summarize_page\",\"description\":\"Summarize current page\",\"arguments\":[{\"name\":\"focus\",\"description\":\"Focus area\"}]}]}}\\n'\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"resources/list\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"resources\":[{\"uri\":\"page://current\",\"name\":\"Current page\",\"description\":\"Current page resource\",\"mimeType\":\"text/html\"}]}}\\n'\n    continue\n  fi\n  printf '{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\\n'\ndone\n",
+        )
+        .expect("write script");
+
+        let mut registry = McpRegistry::new();
+        registry.register_server(McpServerProfile {
+            server_id: "chrome_devtools".into(),
+            display_name: "Chrome DevTools MCP".into(),
+            transport: "stdio".into(),
+            endpoint: format!("sh {}", script_path.display()),
+            auth_ref: None,
+            enabled: true,
+        });
+
+        let mut client = McpClient::new(registry, TransportSelector::default());
+        let catalog = client
+            .discover_server_catalog("chrome_devtools")
+            .expect("discover catalog");
+
+        assert_eq!(catalog.server_id, "chrome_devtools");
+        assert_eq!(catalog.tools.len(), 1);
+        assert_eq!(catalog.tools[0].tool_name, "click");
+        assert!(catalog.tools[0].parameters_schema.contains("selector"));
+        assert_eq!(catalog.prompts.len(), 1);
+        assert_eq!(catalog.prompts[0].prompt_name, "summarize_page");
+        assert!(catalog.prompts[0]
+            .arguments_schema
+            .as_deref()
+            .unwrap_or("{}")
+            .contains("focus"));
+        assert_eq!(catalog.resources.len(), 1);
+        assert_eq!(catalog.resources[0].resource_uri, "page://current");
     }
 
     #[test]

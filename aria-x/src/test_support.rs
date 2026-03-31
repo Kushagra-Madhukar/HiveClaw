@@ -6566,6 +6566,135 @@ enabled = true
     }
 
     #[tokio::test]
+    async fn native_sync_mcp_server_catalog_discovers_imports_and_binds_tools() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let script_path = sessions.path().join("mcp-catalog.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  if printf '%s' \"$line\" | grep -q '\"method\":\"initialize\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-05\",\"capabilities\":{\"tools\":{},\"prompts\":{},\"resources\":{}}}}\\n'\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"notifications/initialized\"'; then\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"tools/list\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"list_pages\",\"description\":\"List open pages\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}]}}\\n'\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"prompts/list\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"prompts\":[{\"name\":\"summarize_page\",\"description\":\"Summarize page\"}]}}\\n'\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"resources/list\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"resources\":[{\"uri\":\"page://current\",\"description\":\"Current page\",\"mimeType\":\"text/html\"}]}}\\n'\n    continue\n  fi\n  printf '{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\\n'\ndone\n",
+        )
+        .expect("write script");
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        store
+            .upsert_mcp_server(
+                &McpServerProfile {
+                    server_id: "chrome_devtools".into(),
+                    display_name: "Chrome DevTools MCP".into(),
+                    transport: "stdio".into(),
+                    endpoint: format!("sh {}", script_path.display()),
+                    auth_ref: None,
+                    enabled: true,
+                },
+                1,
+            )
+            .expect("upsert server");
+        let exec = NativeToolExecutor {
+            tx_cron: {
+                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                tx
+            },
+            invoking_agent_id: Some("developer".into()),
+            session_id: None,
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Cli),
+            session_memory: None,
+            cedar: None,
+            sessions_dir: Some(sessions.path().to_path_buf()),
+            scheduling_intent: None,
+            user_timezone: chrono_tz::UTC,
+        };
+
+        let result = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "sync_mcp_server_catalog".into(),
+                arguments: r#"{"server_id":"chrome_devtools","bind_tools":true,"bind_prompts":true,"bind_resources":true}"#.into(),
+            })
+            .await
+            .expect("sync mcp catalog");
+        assert!(result.render_for_prompt().contains("Synced MCP catalog"));
+        assert_eq!(
+            store
+                .list_mcp_imported_tools("chrome_devtools")
+                .expect("list tools")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_mcp_imported_prompts("chrome_devtools")
+                .expect("list prompts")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_mcp_imported_resources("chrome_devtools")
+                .expect("list resources")
+                .len(),
+            1
+        );
+        let bindings = store
+            .list_mcp_bindings_for_agent("developer")
+            .expect("list bindings");
+        assert_eq!(bindings.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn native_setup_chrome_devtools_mcp_registers_server_and_binds_discovered_tools() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let script_path = sessions.path().join("chrome-devtools-mcp.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  if printf '%s' \"$line\" | grep -q '\"method\":\"initialize\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-05\",\"capabilities\":{\"tools\":{},\"prompts\":{},\"resources\":{}}}}\\n'\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"notifications/initialized\"'; then\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"tools/list\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"take_snapshot\",\"description\":\"Take browser snapshot\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}]}}\\n'\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"prompts/list\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"prompts\":[]}}\\n'\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"resources/list\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"resources\":[]}}\\n'\n    continue\n  fi\n  printf '{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\\n'\ndone\n",
+        )
+        .expect("write script");
+        let exec = NativeToolExecutor {
+            tx_cron: {
+                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                tx
+            },
+            invoking_agent_id: Some("developer".into()),
+            session_id: None,
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Cli),
+            session_memory: None,
+            cedar: None,
+            sessions_dir: Some(sessions.path().to_path_buf()),
+            scheduling_intent: None,
+            user_timezone: chrono_tz::UTC,
+        };
+
+        let result = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "setup_chrome_devtools_mcp".into(),
+                arguments: format!(
+                    r#"{{"server_id":"chrome_devtools","display_name":"Chrome DevTools MCP","endpoint_override":"sh {}","channel":"beta","bind_tools":true}}"#,
+                    script_path.display()
+                ),
+            })
+            .await
+            .expect("setup chrome devtools mcp");
+        assert!(result
+            .render_for_prompt()
+            .contains("Configured Chrome DevTools MCP"));
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        let server = store
+            .list_mcp_servers()
+            .expect("list servers")
+            .into_iter()
+            .find(|server| server.server_id == "chrome_devtools")
+            .expect("chrome devtools server");
+        assert_eq!(server.endpoint, format!("sh {}", script_path.display()));
+        let bindings = store
+            .list_mcp_bindings_for_agent("developer")
+            .expect("list bindings");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].target_name, "take_snapshot");
+    }
+
+    #[tokio::test]
     async fn native_bind_mcp_import_persists_binding_record() {
         let sessions = tempfile::tempdir().expect("sessions");
         let store = RuntimeStore::for_sessions_dir(sessions.path());
@@ -13938,10 +14067,18 @@ exit 0
         assert!(doctor_help.contains("doctor env"));
         assert!(doctor_help.contains("doctor gateway"));
         assert!(doctor_help.contains("doctor browser"));
+        assert!(doctor_help.contains("doctor mcp"));
         let inspect_help = render_cli_help(Some("inspect"));
         assert!(inspect_help.contains("provider-payloads"));
         let explain_help = render_cli_help(Some("explain"));
         assert!(explain_help.contains("provider-payloads"));
+    }
+
+    #[test]
+    fn render_cli_help_lists_setup_topic_for_chrome_devtools_mcp() {
+        let setup_help = render_cli_help(Some("setup"));
+        assert!(setup_help.contains("setup stt --local"));
+        assert!(setup_help.contains("setup chrome-devtools-mcp"));
     }
 
     #[test]
@@ -14001,6 +14138,70 @@ exit 0
     }
 
     #[test]
+    fn render_mcp_doctor_includes_runtime_state() {
+        let cfg = base_test_config();
+        let runtime = load_runtime_env_config().expect("runtime env config");
+        let cfg = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+        let mcp_text = render_mcp_doctor(&cfg, false, None);
+        assert!(mcp_text.contains("MCP doctor"));
+        assert!(mcp_text.contains("feature_enabled:"));
+        assert!(mcp_text.contains("chrome_devtools_registered:"));
+    }
+
+    #[cfg(feature = "mcp-runtime")]
+    #[test]
+    fn render_mcp_doctor_live_reports_probe_success() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let script_path = sessions.path().join("mcp-live.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  if printf '%s' \"$line\" | grep -q '\"method\":\"initialize\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-05\",\"capabilities\":{\"tools\":{},\"prompts\":{},\"resources\":{}}}}\\n'\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"notifications/initialized\"'; then\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"tools/list\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"list_pages\",\"description\":\"List pages\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}]}}\\n'\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"prompts/list\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"prompts\":[]}}\\n'\n    continue\n  fi\n  if printf '%s' \"$line\" | grep -q '\"method\":\"resources/list\"'; then\n    printf '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"resources\":[]}}\\n'\n    continue\n  fi\n  printf '{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\\n'\ndone\n",
+        )
+        .expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .expect("metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).expect("chmod");
+        }
+
+        let mut cfg = base_test_config();
+        cfg.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        let runtime = load_runtime_env_config().expect("runtime env config");
+        let cfg = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        store
+            .upsert_mcp_server(
+                &McpServerProfile {
+                    server_id: "chrome_devtools".into(),
+                    display_name: "Chrome DevTools MCP".into(),
+                    transport: "stdio".into(),
+                    endpoint: format!("sh {}", script_path.display()),
+                    auth_ref: None,
+                    enabled: true,
+                },
+                1,
+            )
+            .expect("upsert server");
+
+        let mcp_text = render_mcp_doctor(&cfg, true, None);
+        assert!(mcp_text.contains("live_probe: ok"));
+        assert!(mcp_text.contains("live_tool_count: 1"));
+        assert!(mcp_text.contains("list_pages"));
+    }
+
+    #[test]
     fn render_shell_completion_supports_zsh_and_rejects_unknown_shell() {
         let zsh = render_shell_completion("zsh").expect("zsh completion");
         assert!(zsh.contains("#compdef aria-x"));
@@ -14031,6 +14232,7 @@ exit 0
         assert!(status.contains("installed default config"));
         let content = std::fs::read_to_string(&target).expect("read target");
         assert!(content.contains("[llm]"));
+        assert!(content.contains("[mesh]"));
     }
 
     #[test]
@@ -15129,6 +15331,14 @@ exit 0
             .expect("leaf_external array")
             .iter()
             .any(|rule| rule["target"] == "github" && rule["classification"] == "leaf_external"));
+        assert!(json["leaf_external"]
+            .as_array()
+            .expect("leaf_external array")
+            .iter()
+            .any(|rule| {
+                rule["target"] == "chrome_devtools"
+                    && rule["classification"] == "leaf_external"
+            }));
     }
 
     #[test]

@@ -82,6 +82,33 @@ impl RuntimeStore {
         )
     }
 
+    pub fn replace_mcp_imported_tools(
+        &self,
+        server_id: &str,
+        tools: &[McpImportedTool],
+        updated_at_us: u64,
+    ) -> Result<(), String> {
+        self.replace_mcp_import_payloads(server_id, "tool", tools, updated_at_us)
+    }
+
+    pub fn replace_mcp_imported_prompts(
+        &self,
+        server_id: &str,
+        prompts: &[McpImportedPrompt],
+        updated_at_us: u64,
+    ) -> Result<(), String> {
+        self.replace_mcp_import_payloads(server_id, "prompt", prompts, updated_at_us)
+    }
+
+    pub fn replace_mcp_imported_resources(
+        &self,
+        server_id: &str,
+        resources: &[McpImportedResource],
+        updated_at_us: u64,
+    ) -> Result<(), String> {
+        self.replace_mcp_import_payloads(server_id, "resource", resources, updated_at_us)
+    }
+
     fn upsert_mcp_import_payload<T: serde::Serialize>(
         &self,
         import_id: &str,
@@ -104,6 +131,41 @@ impl RuntimeStore {
             params![import_id, server_id, kind, payload, updated_at_us as i64],
         )
         .map_err(|e| format!("write mcp import failed: {}", e))?;
+        Ok(())
+    }
+
+    fn replace_mcp_import_payloads<T: serde::Serialize>(
+        &self,
+        server_id: &str,
+        kind: &str,
+        payloads: &[T],
+        updated_at_us: u64,
+    ) -> Result<(), String> {
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("open mcp import replace transaction failed: {}", e))?;
+        tx.execute(
+            "DELETE FROM mcp_imports WHERE server_id=?1 AND kind=?2",
+            params![server_id, kind],
+        )
+        .map_err(|e| format!("clear mcp imports failed: {}", e))?;
+        for payload_value in payloads {
+            let payload = serde_json::to_string(payload_value)
+                .map_err(|e| format!("serialize mcp import failed: {}", e))?;
+            let import_id = serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|value| value.get("import_id").and_then(|id| id.as_str()).map(str::to_string))
+                .ok_or_else(|| "replace_mcp_import_payloads requires payloads with import_id".to_string())?;
+            tx.execute(
+                "INSERT INTO mcp_imports (import_id, server_id, kind, payload_json, updated_at_us)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![import_id, server_id, kind, payload, updated_at_us as i64],
+            )
+            .map_err(|e| format!("write mcp import failed: {}", e))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("commit mcp import replace failed: {}", e))?;
         Ok(())
     }
 
